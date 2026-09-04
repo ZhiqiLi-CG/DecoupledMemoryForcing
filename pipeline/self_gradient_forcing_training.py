@@ -18,12 +18,8 @@ class SelfGradientForcingTrainingPipeline:
     one-pass Self Forcing variants below.
     """
 
-    # memory_decoupling_forcing        writes memory through a LoRA adapter
-    # memory_decoupling_forcing_direct  writes it through the K/V projections
-    # themselves. Same rollout either way; they differ only in what carries the
-    # gradient of a memory write.
     GRAD_MODES = ("self_gradient_forcing", "self_forcing", "self_forcing_no_sg",
-                  "memory_decoupling_forcing", "memory_decoupling_forcing_direct")
+                  "memory_decoupling_forcing")
 
     def __init__(
         self,
@@ -49,12 +45,6 @@ class SelfGradientForcingTrainingPipeline:
                 f"grad_mode must be one of {self.GRAD_MODES}. Got {grad_mode!r}."
             )
         self.grad_mode = grad_mode
-        # Which mechanism makes a memory write differentiable; "none" for
-        # the modes that do not decouple memory at all.
-        self.memory_writer = {
-            "memory_decoupling_forcing": "lora",
-            "memory_decoupling_forcing_direct": "direct",
-        }.get(grad_mode, "none")
 
         self.scheduler = scheduler
         self.generator = generator
@@ -139,7 +129,7 @@ class SelfGradientForcingTrainingPipeline:
                 return_sim_step=return_sim_step,
                 **conditional_dict,
             )
-        if self.grad_mode in ("memory_decoupling_forcing", "memory_decoupling_forcing_direct"):
+        if self.grad_mode == "memory_decoupling_forcing":
             return self._memory_decoupling_forcing_inference(
                 noise=noise,
                 clean_image_or_video=clean_image_or_video,
@@ -659,10 +649,10 @@ class SelfGradientForcingTrainingPipeline:
             context_timestep = torch.ones_like(timestep) * self.context_noise
             # Decoupled memory. The refresh forward runs under no_grad, so none
             # of its activations are retained; the only differentiable part is
-            # the MemoryLoRA on the K/V projection, which takes a detached input
-            # (K = sg(W_k h) + LoRA(sg(h))). KV_i therefore depends on neither
-            # KV_<i nor on how earlier blocks were generated, while a later
-            # frame's loss still supervises the memory write through the adapter.
+            # the K/V projection, which takes a detached input (K = W_k sg(h)).
+            # KV_i therefore depends on neither KV_<i nor on how earlier blocks
+            # were generated, while a later frame's loss still supervises the
+            # memory write through those projections.
             x0_ctx = x0_cache.detach()
             ctx_grad = False
             x_ctx = self.scheduler.add_noise(
@@ -679,10 +669,10 @@ class SelfGradientForcingTrainingPipeline:
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
-                    # Route the memory write through this mode's writer, the
-                    # same one inference uses. Gated on grad_allowed so critic
-                    # steps, which run the generator in no_grad, build nothing.
-                    memory_write=self.memory_writer,
+                    # Write memory through the K/V projections, the same way
+                    # inference does. Gated on grad_allowed so critic steps,
+                    # which run the generator in no_grad, build nothing.
+                    memory_write=True,
                     memory_write_grad=grad_allowed,
                 )
 

@@ -98,26 +98,9 @@ class Trainer:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
-        # The Decoupled Memory adapters start at zero and carry the whole
-        # memory-writing signal, so the backbone's tiny lr leaves them inert:
-        # measured, they reach 0.03% of the frozen projection's norm after 100
-        # steps. Give them their own group when lr_memory_lora is configured.
-        # fsdp_wrap uses use_orig_params=True, so names survive the wrapping.
-        gen_params = [p for p in self.model.generator.parameters() if p.requires_grad]
-        lora_params = [p for n, p in self.model.generator.named_parameters()
-                       if p.requires_grad and "memory_lora" in n]
-        if lora_params:
-            lora_ids = {id(p) for p in lora_params}
-            base_params = [p for p in gen_params if id(p) not in lora_ids]
-            lora_lr = float(getattr(config, "lr_memory_lora", config.lr))
-            param_groups = [{"params": base_params, "lr": config.lr},
-                            {"params": lora_params, "lr": lora_lr}]
-            print(f"generator optimizer: {len(base_params)} backbone tensors at lr="
-                  f"{config.lr}, {len(lora_params)} memory-adapter tensors at lr={lora_lr}")
-        else:
-            param_groups = [{"params": gen_params, "lr": config.lr}]
         self.generator_optimizer = torch.optim.AdamW(
-            param_groups,
+            [param for param in self.model.generator.parameters()
+             if param.requires_grad],
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
@@ -188,20 +171,9 @@ class Trainer:
                         k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
                     fixed[k] = v
                 state_dict = fixed
-            # The Decoupled Memory adapters are absent from every pretrained
-            # checkpoint by design: they are zero-initialised and learned from
-            # scratch, so a relaxed load still reproduces the checkpoint exactly.
-            # The assertion keeps the check strict for everything else.
-            strict = not getattr(
-                getattr(config, "model_kwargs", {}), "decoupled_memory", False)
-            result = self.model.generator.load_state_dict(
-                state_dict, strict=strict
+            self.model.generator.load_state_dict(
+                state_dict, strict=True
             )
-            if not strict:
-                unexpected_missing = [
-                    k for k in result.missing_keys if "memory_lora" not in k]
-                assert not unexpected_missing, (
-                    f"keys missing beyond the memory adapters: {unexpected_missing[:5]}")
 
         ##############################################################################################################
 

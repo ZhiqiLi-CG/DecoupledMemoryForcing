@@ -126,19 +126,14 @@ class WanDiffusionWrapper(torch.nn.Module):
         super().__init__()
 
         # decoupled_memory swaps in the standalone Decoupled Memory Forcing
-        # model: the causal model plus a MemoryLoRA on the K/V projection, which
-        # is how that method writes a differentiable KV cache. Defaults off, so
-        # every other grad_mode loads exactly the model it always did.
+        # model. It adds no parameters -- it differs from the causal model only
+        # in how the cache-refresh forward routes gradients -- so it loads the
+        # same pretrained weights. Defaults off, so every other grad_mode loads
+        # exactly the model it always did.
         self.decoupled_memory = decoupled_memory
         if is_causal and decoupled_memory:
-            # The MemoryLoRA weights are not in the pretrained checkpoint. The
-            # meta-device fast path refuses to leave any key uninitialised, so
-            # load eagerly and let the adapters keep their own init (up=0, i.e.
-            # the adapter starts as a no-op and the pretrained model is
-            # reproduced exactly at step 0).
             self.model = DecoupledMemoryWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size,
-                low_cpu_mem_usage=False, device_map=None)
+                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         elif is_causal:
             self.model = CausalWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
