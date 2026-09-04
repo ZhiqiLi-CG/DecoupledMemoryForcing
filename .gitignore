@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local environments
+.env
+.venv/
+venv/
+
+# Model/data artifacts
+checkpoints/
+wan_models/
+dataset/
+prompts/vidprom_filtered_extended.txt
+/config.json
+/model_index.json
+logs/
+outputs/
+output/
+output_*/
+eval_runs/
+.rendezvous/
+
+# Runtime products
+*.mp4
+*.log
+.DS_Store
+
+# ---- added when re-homing this tree to DecoupledMemoryForcing ----
+# Vendored official VBench evaluator: 332M and carries its own .git, so git
+# would refuse to track its contents anyway. Clone it separately when needed:
+#   git clone https://github.com/Vchitect/VBench.git VBench
+VBench/
+
+# Symlinks into /mnt/data. Git would store the link target as text, which is
+# meaningless on another machine.
+checkpoints/
+wan_models/
+prompts/vidprom_filtered_extended.txt
+
+# Run artifacts
+logs/
+outputs/
+.rendezvous/
+__pycache__/
+*.pyc
