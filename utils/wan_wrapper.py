@@ -9,6 +9,7 @@ from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
+from wan.modules.decoupled_memory_model import DecoupledMemoryWanModel
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -119,11 +120,26 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            decoupled_memory=False
     ):
         super().__init__()
 
-        if is_causal:
+        # decoupled_memory swaps in the standalone Decoupled Memory Forcing
+        # model: the causal model plus a MemoryLoRA on the K/V projection, which
+        # is how that method writes a differentiable KV cache. Defaults off, so
+        # every other grad_mode loads exactly the model it always did.
+        self.decoupled_memory = decoupled_memory
+        if is_causal and decoupled_memory:
+            # The MemoryLoRA weights are not in the pretrained checkpoint. The
+            # meta-device fast path refuses to leave any key uninitialised, so
+            # load eagerly and let the adapters keep their own init (up=0, i.e.
+            # the adapter starts as a no-op and the pretrained model is
+            # reproduced exactly at step 0).
+            self.model = DecoupledMemoryWanModel.from_pretrained(
+                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size,
+                low_cpu_mem_usage=False, device_map=None)
+        elif is_causal:
             self.model = CausalWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
@@ -227,7 +243,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         clean_x: Optional[torch.Tensor] = None, # TF
         aug_t: Optional[torch.Tensor] = None, # for TF clean GT, if it's also noisy and needs denoising by the model, aug_t is its timestep
         
-        cache_start: Optional[int] = None
+        cache_start: Optional[int] = None,
+        memory_lora: bool = False,  # Decoupled Memory Forcing: apply the memory adapter
+        memory_lora_grad: bool = False  # ... and make it differentiable
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -240,6 +258,14 @@ class WanDiffusionWrapper(torch.nn.Module):
         logits = None
         # X0 prediction
         if kv_cache is not None:
+            if memory_lora and not self.decoupled_memory:
+                raise ValueError(
+                    "memory_lora requires the Decoupled Memory model; set "
+                    "model_kwargs.decoupled_memory=true in the config.")
+            extra = {}
+            if memory_lora:
+                extra["memory_lora"] = True
+                extra["memory_lora_grad"] = memory_lora_grad
             flow_pred = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
@@ -247,7 +273,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
-                cache_start=cache_start
+                cache_start=cache_start,
+                **extra
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:

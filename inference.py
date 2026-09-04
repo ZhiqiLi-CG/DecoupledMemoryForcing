@@ -30,6 +30,7 @@ from pipeline import (
     CausalDiffusionInferencePipeline,
     CausalInferencePipeline,
 )
+from pipeline.decoupled_memory_inference import DecoupledMemoryInferencePipeline
 from utils.dataset import TextDataset, TextImagePairDataset
 from utils.misc import set_seed
 
@@ -93,8 +94,12 @@ config = OmegaConf.merge(default_config, config)
 
 # Initialize pipeline
 if hasattr(config, 'denoising_step_list'):
-    # Few-step inference
-    pipeline = CausalInferencePipeline(config, device=device)
+    # Few-step inference. Decoupled Memory Forcing needs its own pipeline: the
+    # cache refresh must go through the memory adapter it was trained with.
+    if getattr(getattr(config, "model_kwargs", {}), "decoupled_memory", False):
+        pipeline = DecoupledMemoryInferencePipeline(config, device=device)
+    else:
+        pipeline = CausalInferencePipeline(config, device=device)
 else:
     # Multi-step diffusion inference
     pipeline = CausalDiffusionInferencePipeline(config, device=device)

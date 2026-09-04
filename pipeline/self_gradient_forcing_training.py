@@ -18,7 +18,8 @@ class SelfGradientForcingTrainingPipeline:
     one-pass Self Forcing variants below.
     """
 
-    GRAD_MODES = ("self_gradient_forcing", "self_forcing", "self_forcing_no_sg")
+    GRAD_MODES = ("self_gradient_forcing", "self_forcing", "self_forcing_no_sg",
+                  "memory_decoupling_forcing")
 
     def __init__(
         self,
@@ -122,6 +123,14 @@ class SelfGradientForcingTrainingPipeline:
     ) -> torch.Tensor:
         if self.grad_mode == "self_gradient_forcing":
             return self._self_gradient_forcing_inference(
+                noise=noise,
+                clean_image_or_video=clean_image_or_video,
+                initial_latent=initial_latent,
+                return_sim_step=return_sim_step,
+                **conditional_dict,
+            )
+        if self.grad_mode == "memory_decoupling_forcing":
+            return self._memory_decoupling_forcing_inference(
                 noise=noise,
                 clean_image_or_video=clean_image_or_video,
                 initial_latent=initial_latent,
@@ -546,6 +555,145 @@ class SelfGradientForcingTrainingPipeline:
             return output, denoised_timestep_from, denoised_timestep_to, idx + 1
         return output, denoised_timestep_from, denoised_timestep_to
     # END
+
+    def _memory_decoupling_forcing_inference(
+        self,
+        noise: torch.Tensor,
+        clean_image_or_video: torch.Tensor = None,
+        initial_latent: Optional[torch.Tensor] = None,
+        return_sim_step: bool = False,
+        **conditional_dict,
+    ) -> torch.Tensor:
+        """Memory Decoupling Forcing: differentiable memory, decoupled frames.
+
+        One pass, like Self Forcing, but the two things Self Forcing couples are
+        split apart at the cache refresh:
+
+        * the *input* to the refresh is detached, so block i's stored K/V carry
+          no dependency on how earlier blocks were generated -- frames never
+          chain into one another and there is no recursive BPTT;
+        * the refresh forward itself keeps its gradient, so the stored K/V stay
+          in the graph and later blocks' losses can supervise how context is
+          written into memory.
+
+        Self Forcing gets neither (frozen cache); ``self_forcing_no_sg`` gets
+        both and pays full BPTT. Self Gradient Forcing reaches the same
+        supervision through a second parallel replay instead of in the rollout.
+        """
+        assert initial_latent is None, "Self Forcing training assumes text-to-video inputs."
+        # Respect the caller's grad mode. critic_loss runs the generator inside
+        # torch.no_grad(); set_grad_enabled(True) would override that and build
+        # a full graph per block for a step whose gradients are thrown away.
+        grad_allowed = torch.is_grad_enabled()
+        batch_size, num_frames, num_channels, height, width = noise.shape
+        assert num_frames % self.num_frame_per_block == 0
+        num_blocks = num_frames // self.num_frame_per_block
+        device, dtype = noise.device, noise.dtype
+
+        self._initialize_kv_cache(batch_size=batch_size, dtype=dtype, device=device)
+        self._initialize_crossattn_cache(batch_size=batch_size, dtype=dtype, device=device)
+
+        num_denoising_steps = len(self.denoising_step_list)
+        if self.self_gradient_forcing_cache_mode == "exit" and self.per_rank_exit_step:
+            idx = int(torch.randint(low=0, high=num_denoising_steps, size=(1,), device=device).item())
+        else:
+            idx = int(self.generate_and_sync_list(1, num_denoising_steps, device=device)[0])
+
+        output = torch.zeros_like(noise)
+
+        all_num_frames = [self.num_frame_per_block] * num_blocks
+        current_start_frame = 0
+        for current_num_frames in all_num_frames:
+            noisy_input = noise[:, current_start_frame:current_start_frame + current_num_frames]
+            x0_exit = None
+            timestep = None
+
+            for index, current_timestep in enumerate(self.denoising_step_list):
+                timestep = torch.ones(
+                    [batch_size, current_num_frames], device=device, dtype=torch.int64
+                ) * current_timestep
+
+                # The exit step is the only differentiated forward.
+                with torch.set_grad_enabled(grad_allowed and index == idx):
+                    _, x0 = self.generator(
+                        noisy_image_or_video=noisy_input,
+                        conditional_dict=conditional_dict,
+                        timestep=timestep,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                    )
+
+                if index == idx:
+                    x0_exit = x0
+                    if self.self_gradient_forcing_cache_mode == "exit" and not self.per_rank_exit_step:
+                        break
+
+                if index < num_denoising_steps - 1:
+                    # Past the exit step the schedule must not extend the graph.
+                    x0_next = x0.detach()
+                    noisy_input = self.scheduler.add_noise(
+                        x0_next.flatten(0, 1),
+                        torch.randn_like(x0_next.flatten(0, 1)),
+                        self.denoising_step_list[index + 1] * torch.ones(
+                            [batch_size * current_num_frames], device=device, dtype=torch.long
+                        ),
+                    ).unflatten(0, x0_next.shape[:2])
+
+            if x0_exit is None:
+                raise RuntimeError("Failed to capture the Self Forcing exit state.")
+
+            x0_cache = x0 if self.self_gradient_forcing_cache_mode == "final_clean" else x0_exit
+            output[:, current_start_frame:current_start_frame + current_num_frames] = x0_exit
+
+            context_timestep = torch.ones_like(timestep) * self.context_noise
+            # Decoupled memory. The refresh forward runs under no_grad, so none
+            # of its activations are retained; the only differentiable part is
+            # the MemoryLoRA on the K/V projection, which takes a detached input
+            # (K = sg(W_k h) + LoRA(sg(h))). KV_i therefore depends on neither
+            # KV_<i nor on how earlier blocks were generated, while a later
+            # frame's loss still supervises the memory write through the adapter.
+            x0_ctx = x0_cache.detach()
+            ctx_grad = False
+            x_ctx = self.scheduler.add_noise(
+                x0_ctx.flatten(0, 1),
+                torch.randn_like(x0_ctx.flatten(0, 1)),
+                context_timestep.flatten(0, 1).long(),
+            ).unflatten(0, x0_ctx.shape[:2])
+
+            with torch.set_grad_enabled(grad_allowed and ctx_grad):
+                self.generator(
+                    noisy_image_or_video=x_ctx,
+                    conditional_dict=conditional_dict,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                    # Route the memory write through the adapter. Gated on
+                    # grad_allowed so critic steps, which run the generator in
+                    # no_grad, build nothing at all.
+                    memory_lora=True,
+                    memory_lora_grad=grad_allowed,
+                )
+
+            current_start_frame += current_num_frames
+
+        if idx == num_denoising_steps - 1:
+            denoised_timestep_to = 0
+            denoised_timestep_from = 1000 - torch.argmin(
+                (self.scheduler.timesteps.to(device) - self.denoising_step_list[idx].to(device)).abs(), dim=0
+            ).item()
+        else:
+            denoised_timestep_to = 1000 - torch.argmin(
+                (self.scheduler.timesteps.to(device) - self.denoising_step_list[idx + 1].to(device)).abs(), dim=0
+            ).item()
+            denoised_timestep_from = 1000 - torch.argmin(
+                (self.scheduler.timesteps.to(device) - self.denoising_step_list[idx].to(device)).abs(), dim=0
+            ).item()
+
+        if return_sim_step:
+            return output, denoised_timestep_from, denoised_timestep_to, idx + 1
+        return output, denoised_timestep_from, denoised_timestep_to
 
     def _initialize_kv_cache(self, batch_size, dtype, device):
         kv_cache1 = []
