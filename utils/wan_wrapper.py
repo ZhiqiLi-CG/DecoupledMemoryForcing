@@ -244,8 +244,12 @@ class WanDiffusionWrapper(torch.nn.Module):
         aug_t: Optional[torch.Tensor] = None, # for TF clean GT, if it's also noisy and needs denoising by the model, aug_t is its timestep
         
         cache_start: Optional[int] = None,
-        memory_lora: bool = False,  # Decoupled Memory Forcing: apply the memory adapter
-        memory_lora_grad: bool = False  # ... and make it differentiable
+        # Decoupled Memory Forcing: how this forward writes memory.
+        #   "none"   ordinary forward, nothing extra
+        #   "lora"   K = sg(W_k h) + LoRA(sg(h))
+        #   "direct" K = W_k sg(h), no adapter, the projections carry the gradient
+        memory_write: str = "none",
+        memory_write_grad: bool = False  # ... and make that write differentiable
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -258,14 +262,16 @@ class WanDiffusionWrapper(torch.nn.Module):
         logits = None
         # X0 prediction
         if kv_cache is not None:
-            if memory_lora and not self.decoupled_memory:
+            if memory_write != "none" and not self.decoupled_memory:
                 raise ValueError(
-                    "memory_lora requires the Decoupled Memory model; set "
-                    "model_kwargs.decoupled_memory=true in the config.")
+                    "memory_write=%r requires the Decoupled Memory model; set "
+                    "model_kwargs.decoupled_memory=true in the config." % (memory_write,))
+            # Passed through `extra` so the other models' forward signatures stay
+            # untouched -- they never see these keys.
             extra = {}
-            if memory_lora:
-                extra["memory_lora"] = True
-                extra["memory_lora_grad"] = memory_lora_grad
+            if memory_write != "none":
+                extra["memory_write"] = memory_write
+                extra["memory_write_grad"] = memory_write_grad
             flow_pred = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,

@@ -18,8 +18,12 @@ class SelfGradientForcingTrainingPipeline:
     one-pass Self Forcing variants below.
     """
 
+    # memory_decoupling_forcing        writes memory through a LoRA adapter
+    # memory_decoupling_forcing_direct  writes it through the K/V projections
+    # themselves. Same rollout either way; they differ only in what carries the
+    # gradient of a memory write.
     GRAD_MODES = ("self_gradient_forcing", "self_forcing", "self_forcing_no_sg",
-                  "memory_decoupling_forcing")
+                  "memory_decoupling_forcing", "memory_decoupling_forcing_direct")
 
     def __init__(
         self,
@@ -45,6 +49,12 @@ class SelfGradientForcingTrainingPipeline:
                 f"grad_mode must be one of {self.GRAD_MODES}. Got {grad_mode!r}."
             )
         self.grad_mode = grad_mode
+        # Which mechanism makes a memory write differentiable; "none" for
+        # the modes that do not decouple memory at all.
+        self.memory_writer = {
+            "memory_decoupling_forcing": "lora",
+            "memory_decoupling_forcing_direct": "direct",
+        }.get(grad_mode, "none")
 
         self.scheduler = scheduler
         self.generator = generator
@@ -129,7 +139,7 @@ class SelfGradientForcingTrainingPipeline:
                 return_sim_step=return_sim_step,
                 **conditional_dict,
             )
-        if self.grad_mode == "memory_decoupling_forcing":
+        if self.grad_mode in ("memory_decoupling_forcing", "memory_decoupling_forcing_direct"):
             return self._memory_decoupling_forcing_inference(
                 noise=noise,
                 clean_image_or_video=clean_image_or_video,
@@ -669,11 +679,11 @@ class SelfGradientForcingTrainingPipeline:
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
-                    # Route the memory write through the adapter. Gated on
-                    # grad_allowed so critic steps, which run the generator in
-                    # no_grad, build nothing at all.
-                    memory_lora=True,
-                    memory_lora_grad=grad_allowed,
+                    # Route the memory write through this mode's writer, the
+                    # same one inference uses. Gated on grad_allowed so critic
+                    # steps, which run the generator in no_grad, build nothing.
+                    memory_write=self.memory_writer,
+                    memory_write_grad=grad_allowed,
                 )
 
             current_start_frame += current_num_frames

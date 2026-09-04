@@ -59,6 +59,13 @@ class DecoupledMemoryInferencePipeline(torch.nn.Module):
         self.args = args
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
+        # Memory must be written the same way it was during training, or the
+        # cache will not hold what training optimised, so the writer is derived
+        # from the same grad_mode rather than hardcoded here.
+        self.memory_writer = {
+            "memory_decoupling_forcing": "lora",
+            "memory_decoupling_forcing_direct": "direct",
+        }.get(getattr(args, "grad_mode", None), "lora")
         self.local_attn_size = self.generator.model.local_attn_size
 
         # Timing state; populated only when `report_timing=True` is passed to
@@ -311,9 +318,11 @@ class DecoupledMemoryInferencePipeline(torch.nn.Module):
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
-                # Memory is written through the adapter, exactly as in training.
-                # No graph is built: inference already runs under no_grad.
-                memory_lora=True,
+                # Written by the same writer training used. No graph is built:
+                # inference already runs under no_grad. For the "direct" writer
+                # this call is numerically identical to the base model's, so the
+                # two paths cannot silently diverge.
+                memory_write=self.memory_writer,
             )
 
             if profile:

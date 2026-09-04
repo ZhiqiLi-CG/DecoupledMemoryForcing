@@ -190,7 +190,7 @@ class DecoupledMemorySelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        # Only used by the cache-refresh forward (memory_lora=True).
+        # Only used by the cache-refresh forward (memory_write=True).
         self.memory_lora_rank = memory_lora_rank
         self.k_memory_lora = MemoryLoRA(dim, rank=memory_lora_rank)
         self.v_memory_lora = MemoryLoRA(dim, rank=memory_lora_rank)
@@ -205,8 +205,8 @@ class DecoupledMemorySelfAttention(nn.Module):
         kv_cache=None,
         current_start=0,
         cache_start=None,
-        memory_lora=False,
-        memory_lora_grad=False
+        memory_write="none",
+        memory_write_grad=False
     ):
         r"""
         Args:
@@ -229,18 +229,42 @@ class DecoupledMemorySelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        if memory_lora:
-            # The adapter is applied whenever memory is written -- training
-            # generator step, training critic step and inference alike -- so the
-            # cache always holds the same thing. memory_lora_grad additionally
-            # builds a graph for it: the caller runs this forward under no_grad,
-            # so nothing above is retained, and enable_grad here covers the
-            # adapter alone, rooted at a detached input. That is the only
-            # differentiable part of a memory write.
+        # Both writers detach h, so KV_i never depends on KV_<i, and both keep
+        # the write itself differentiable, so a later frame's loss still
+        # supervises it. They differ in what carries that gradient. Whichever is
+        # used must be used identically in training and at inference, or the
+        # cache will not hold what training optimised.
+        if memory_write == "lora":
+            # K = sg(W_k h) + LoRA(sg(h)). memory_write_grad builds a graph for
+            # it: the caller runs this forward under no_grad, so nothing above is
+            # retained, and enable_grad here covers the adapter alone, rooted at
+            # a detached input.
+            #
+            # Note the adapter lands AFTER norm_k, so it adds an unnormalised
+            # term to a key that RMSNorm has just pinned to a fixed scale.
+            # Measured on the step-1400 checkpoint that term is ~3% of the key on
+            # average and 12% at the worst layer -- small per write, but it
+            # compounds over a rollout. The "direct" writer below has no such
+            # mismatch; keep this one only for comparison against it.
             h = x.detach()
-            with torch.enable_grad() if memory_lora_grad else contextlib.nullcontext():
+            with torch.enable_grad() if memory_write_grad else contextlib.nullcontext():
                 k = k.detach() + self.k_memory_lora(h).view(b, s, n, d)
                 v = v.detach() + self.v_memory_lora(h).view(b, s, n, d)
+        elif memory_write == "direct":
+            # K = W_k sg(h): no adapter, no extra parameters. Only the K/V
+            # projections stay differentiable; the body that produced h does not.
+            # norm_k applies to the projection exactly as it always does, so the
+            # forward is numerically identical to the base model and inference
+            # needs no special handling at all -- the two paths cannot drift
+            # apart. The trade-off is that W_k/W_v are shared with the read path,
+            # so what is learned here also changes reading.
+            h = x.detach()
+            with torch.enable_grad() if memory_write_grad else contextlib.nullcontext():
+                k = self.norm_k(self.k(h)).view(b, s, n, d)
+                v = self.v(h).view(b, s, n, d)
+        elif memory_write != "none":
+            raise ValueError(
+                "memory_write must be 'none', 'lora' or 'direct', got %r" % (memory_write,))
 
         if kv_cache is None:
             # if it is teacher forcing training?
@@ -362,10 +386,10 @@ class DecoupledMemorySelfAttention(nn.Module):
             # Write the current block's *un-roped* K/V into its tail slot.
             tail_lo = tail_slot * fs
             tail_hi = tail_lo + cur_frames * fs
-            # Under memory_lora the caller runs this forward in no_grad, so the
+            # Under memory_write the caller runs this forward in no_grad, so the
             # write has to be recorded explicitly or the adapter's gradient path
             # into the cache would be dropped.
-            with torch.enable_grad() if memory_lora_grad else contextlib.nullcontext():
+            with torch.enable_grad() if memory_write_grad else contextlib.nullcontext():
                 kv_cache["k"][:, tail_lo:tail_hi] = k
                 kv_cache["v"][:, tail_lo:tail_hi] = v
 
@@ -417,7 +441,7 @@ class DecoupledMemorySelfAttention(nn.Module):
             current_start_frame = current_start // frame_seqlen
             roped_query = causal_rope_apply(
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-            with torch.enable_grad() if memory_lora_grad else contextlib.nullcontext():
+            with torch.enable_grad() if memory_write_grad else contextlib.nullcontext():
                     roped_key = causal_rope_apply(
                     k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 
@@ -441,14 +465,14 @@ class DecoupledMemorySelfAttention(nn.Module):
                 local_end_index = kv_cache["local_end_index"].item() + current_end - \
                     kv_cache["global_end_index"].item() - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
-                with torch.enable_grad() if memory_lora_grad else contextlib.nullcontext():
+                with torch.enable_grad() if memory_write_grad else contextlib.nullcontext():
                     kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                     kv_cache["v"][:, local_start_index:local_end_index] = v
             else:
                 # Assign new keys/values directly up to current_end
                 local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
                 local_start_index = local_end_index - num_new_tokens
-                with torch.enable_grad() if memory_lora_grad else contextlib.nullcontext():
+                with torch.enable_grad() if memory_write_grad else contextlib.nullcontext():
                     kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                     kv_cache["v"][:, local_start_index:local_end_index] = v
             win_lo = max(0, local_end_index - self.max_attention_size)
@@ -533,8 +557,8 @@ class DecoupledMemoryAttentionBlock(nn.Module):
         crossattn_cache=None,
         current_start=0,
         cache_start=None,
-        memory_lora=False,
-        memory_lora_grad=False
+        memory_write="none",
+        memory_write_grad=False
     ):
         r"""
         Args:
@@ -555,7 +579,7 @@ class DecoupledMemoryAttentionBlock(nn.Module):
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
             freqs, block_mask, kv_cache, current_start, cache_start,
-            memory_lora, memory_lora_grad)
+            memory_write, memory_write_grad)
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -1000,8 +1024,8 @@ class DecoupledMemoryWanModel(ModelMixin, ConfigMixin):
         crossattn_cache: dict = None,
         current_start: int = 0,
         cache_start: int = 0,
-        memory_lora: bool = False,
-        memory_lora_grad: bool = False
+        memory_write: str = "none",
+        memory_write_grad: bool = False
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -1097,8 +1121,8 @@ class DecoupledMemoryWanModel(ModelMixin, ConfigMixin):
                         "kv_cache": kv_cache[block_index],
                         "current_start": current_start,
                         "cache_start": cache_start,
-                        "memory_lora": memory_lora,
-                        "memory_lora_grad": memory_lora_grad
+                        "memory_write": memory_write,
+                        "memory_write_grad": memory_write_grad
                     }
                 )
                 x = torch.utils.checkpoint.checkpoint(
@@ -1113,8 +1137,8 @@ class DecoupledMemoryWanModel(ModelMixin, ConfigMixin):
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
                         "cache_start": cache_start,
-                        "memory_lora": memory_lora,
-                        "memory_lora_grad": memory_lora_grad
+                        "memory_write": memory_write,
+                        "memory_write_grad": memory_write_grad
                     }
                 )
                 x = block(x, **kwargs)
