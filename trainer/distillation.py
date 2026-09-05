@@ -98,9 +98,28 @@ class Trainer:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
+        # The memory-writer adapter starts at zero and has to travel a long way
+        # to say anything, while the backbone only needs nudging; at the shared
+        # lr it stays inert and "dW is small" would be unreadable -- it could
+        # mean the two projections want to be the same, or just that nothing
+        # could move. Give it its own lr when lr_memory_lora is configured.
+        # Models without such parameters take the single-group path unchanged.
+        # fsdp_wrap uses use_orig_params=True, so names survive the wrapping.
+        gen_params = [p for p in self.model.generator.parameters() if p.requires_grad]
+        lora_params = [p for n, p in self.model.generator.named_parameters()
+                       if p.requires_grad and "memory_lora" in n]
+        if lora_params:
+            lora_ids = {id(p) for p in lora_params}
+            base_params = [p for p in gen_params if id(p) not in lora_ids]
+            lora_lr = float(getattr(config, "lr_memory_lora", config.lr))
+            param_groups = [{"params": base_params, "lr": config.lr},
+                            {"params": lora_params, "lr": lora_lr}]
+            print(f"generator optimizer: {len(base_params)} backbone tensors at lr="
+                  f"{config.lr}, {len(lora_params)} memory-adapter tensors at lr={lora_lr}")
+        else:
+            param_groups = [{"params": gen_params, "lr": config.lr}]
         self.generator_optimizer = torch.optim.AdamW(
-            [param for param in self.model.generator.parameters()
-             if param.requires_grad],
+            param_groups,
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay

@@ -11,6 +11,7 @@ from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 from wan.modules.decoupled_memory_model import DecoupledMemoryWanModel
 from wan.modules.ema_memory_model import EMAMemoryWanModel
+from wan.modules.memory_lora_model import MemoryLoRAWanModel
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -123,7 +124,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             local_attn_size=-1,
             sink_size=0,
             decoupled_memory=False,
-            ema_memory=False
+            ema_memory=False,
+            memory_lora_writer=False
     ):
         super().__init__()
 
@@ -260,6 +262,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         # the recurrence advances once per frame instead of twice.
         ema_update: bool = False,
         memory_write: str = "none",
+        # Separated memory/generation projections: mark the forward that writes
+        # memory, so it uses (W + dW) rather than W.
+        memory_lora_write: bool = False,
         memory_write_grad: bool = False  # ... and make that write differentiable
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
@@ -280,6 +285,12 @@ class WanDiffusionWrapper(torch.nn.Module):
             # Passed through `extra` so the other models' forward signatures stay
             # untouched -- they never see these keys.
             extra = {}
+            if memory_lora_write:
+                if not self.memory_lora_writer:
+                    raise ValueError(
+                        "memory_lora_write requires the memory-LoRA model; set "
+                        "model_kwargs.memory_lora_writer=true in the config.")
+                extra["memory_write"] = True
             if ema_update:
                 if not self.ema_memory:
                     raise ValueError(
