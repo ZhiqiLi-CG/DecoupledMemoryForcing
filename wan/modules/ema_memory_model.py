@@ -193,10 +193,15 @@ class EMAMemorySelfAttention(nn.Module):
         # EMA starts as (almost) the identity and step 0 reproduces the
         # pretrained model; the memory grows only as training pulls alpha down.
         self.frame_seq_length = 1560
-        self.ema_logit = nn.Parameter(torch.tensor(float(EMA_INIT_LOGIT)))
+        # Shape [1], not a 0-dim scalar: FSDP rejects scalar parameters outright
+        # ("Change ... to a 1D tensor with numel equal to 1"). Single-GPU runs
+        # never hit that, so the shape only matters once the model is wrapped.
+        self.ema_logit = nn.Parameter(torch.tensor([float(EMA_INIT_LOGIT)]))
 
     def ema_alpha(self):
-        return torch.sigmoid(self.ema_logit)
+        # Indexed back to 0-dim so it broadcasts against [T, T] and [B, F, N, D]
+        # alike; the stored parameter stays 1-D for FSDP.
+        return torch.sigmoid(self.ema_logit)[0]
 
     def _ema_decay_matrix(self, num_frames, device, dtype):
         """Lower-triangular W with K_hat = W @ K, i.e. the prefix scan in closed form.
