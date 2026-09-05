@@ -18,8 +18,11 @@ class SelfGradientForcingTrainingPipeline:
     one-pass Self Forcing variants below.
     """
 
+    # ema_memory_forcing is Self Gradient Forcing with the context K/V replaced
+    # by a running average along time. The rollout is byte-for-byte SGF's -- the
+    # difference lives inside the model's attention, not here.
     GRAD_MODES = ("self_gradient_forcing", "self_forcing", "self_forcing_no_sg",
-                  "memory_decoupling_forcing")
+                  "memory_decoupling_forcing", "ema_memory_forcing")
 
     def __init__(
         self,
@@ -45,6 +48,11 @@ class SelfGradientForcingTrainingPipeline:
                 f"grad_mode must be one of {self.GRAD_MODES}. Got {grad_mode!r}."
             )
         self.grad_mode = grad_mode
+        # Marks the pass-1 refresh forward as the memory write, so the EMA
+        # advances once per frame. Every caller of this pipeline goes through
+        # it -- generator step, critic step and pass 1 alike -- so there is no
+        # path that builds the cache a different way.
+        self.ema_memory = (grad_mode == "ema_memory_forcing")
 
         self.scheduler = scheduler
         self.generator = generator
@@ -121,7 +129,7 @@ class SelfGradientForcingTrainingPipeline:
         return_sim_step: bool = False,
         **conditional_dict,
     ) -> torch.Tensor:
-        if self.grad_mode == "self_gradient_forcing":
+        if self.grad_mode in ("self_gradient_forcing", "ema_memory_forcing"):
             return self._self_gradient_forcing_inference(
                 noise=noise,
                 clean_image_or_video=clean_image_or_video,
@@ -249,6 +257,10 @@ class SelfGradientForcingTrainingPipeline:
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
+                    # The refresh is the memory write. The denoising forwards
+                    # above also touch the cache, so leaving this ungated would
+                    # advance the EMA twice per frame.
+                    ema_update=self.ema_memory,
                 )
                 current_start_frame += current_num_frames
 

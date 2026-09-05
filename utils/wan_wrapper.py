@@ -10,6 +10,7 @@ from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 from wan.modules.decoupled_memory_model import DecoupledMemoryWanModel
+from wan.modules.ema_memory_model import EMAMemoryWanModel
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -121,7 +122,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             is_causal=False,
             local_attn_size=-1,
             sink_size=0,
-            decoupled_memory=False
+            decoupled_memory=False,
+            ema_memory=False
     ):
         super().__init__()
 
@@ -130,8 +132,19 @@ class WanDiffusionWrapper(torch.nn.Module):
         # in how the cache-refresh forward routes gradients -- so it loads the
         # same pretrained weights. Defaults off, so every other grad_mode loads
         # exactly the model it always did.
+        # ema_memory swaps in the EMA-memory model, which replaces the context
+        # keys/values with a running average along time. Like the decoupled
+        # model it adds no projections, only a per-layer alpha, so it loads the
+        # same pretrained weights. Defaults off.
+        self.ema_memory = ema_memory
         self.decoupled_memory = decoupled_memory
-        if is_causal and decoupled_memory:
+        if is_causal and ema_memory:
+            # alpha is not in any pretrained checkpoint, so the meta-device fast
+            # path (which refuses to leave a key uninitialised) cannot be used.
+            self.model = EMAMemoryWanModel.from_pretrained(
+                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size,
+                low_cpu_mem_usage=False, device_map=None)
+        elif is_causal and decoupled_memory:
             self.model = DecoupledMemoryWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         elif is_causal:
@@ -243,6 +256,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         #   "none"   ordinary forward, nothing extra
         #   "lora"   K = sg(W_k h) + LoRA(sg(h))
         #   "direct" K = W_k sg(h), no adapter, the projections carry the gradient
+        # EMA memory: mark the forward that writes context into the cache, so
+        # the recurrence advances once per frame instead of twice.
+        ema_update: bool = False,
         memory_write: str = "none",
         memory_write_grad: bool = False  # ... and make that write differentiable
     ) -> torch.Tensor:
@@ -264,6 +280,12 @@ class WanDiffusionWrapper(torch.nn.Module):
             # Passed through `extra` so the other models' forward signatures stay
             # untouched -- they never see these keys.
             extra = {}
+            if ema_update:
+                if not self.ema_memory:
+                    raise ValueError(
+                        "ema_update requires the EMA memory model; set "
+                        "model_kwargs.ema_memory=true in the config.")
+                extra["ema_update"] = True
             if memory_write != "none":
                 extra["memory_write"] = memory_write
                 extra["memory_write_grad"] = memory_write_grad
