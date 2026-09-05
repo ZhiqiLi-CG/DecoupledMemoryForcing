@@ -138,9 +138,20 @@ class WanDiffusionWrapper(torch.nn.Module):
         # keys/values with a running average along time. Like the decoupled
         # model it adds no projections, only a per-layer alpha, so it loads the
         # same pretrained weights. Defaults off.
+        # memory_lora_writer gives the memory write its own (W + dW) projection
+        # while generation keeps W, to test whether the two roles want different
+        # representations. dW starts at zero, so step 0 is the pretrained model.
+        self.memory_lora_writer = memory_lora_writer
         self.ema_memory = ema_memory
         self.decoupled_memory = decoupled_memory
-        if is_causal and ema_memory:
+        if is_causal and memory_lora_writer:
+            # dW is absent from any pretrained checkpoint, so the meta-device
+            # fast path (which refuses to leave a key uninitialised) cannot be
+            # used.
+            self.model = MemoryLoRAWanModel.from_pretrained(
+                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size,
+                low_cpu_mem_usage=False, device_map=None)
+        elif is_causal and ema_memory:
             # alpha is not in any pretrained checkpoint, so the meta-device fast
             # path (which refuses to leave a key uninitialised) cannot be used.
             self.model = EMAMemoryWanModel.from_pretrained(
