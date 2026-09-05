@@ -12,6 +12,7 @@ from wan.modules.causal_model import CausalWanModel
 from wan.modules.decoupled_memory_model import DecoupledMemoryWanModel
 from wan.modules.ema_memory_model import EMAMemoryWanModel
 from wan.modules.memory_lora_model import MemoryLoRAWanModel
+from wan.modules.memory_proj_model import MemoryProjWanModel
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -125,7 +126,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             sink_size=0,
             decoupled_memory=False,
             ema_memory=False,
-            memory_lora_writer=False
+            memory_lora_writer=False,
+            memory_proj_writer=False
     ):
         super().__init__()
 
@@ -141,10 +143,20 @@ class WanDiffusionWrapper(torch.nn.Module):
         # memory_lora_writer gives the memory write its own (W + dW) projection
         # while generation keeps W, to test whether the two roles want different
         # representations. dW starts at zero, so step 0 is the pretrained model.
+        # memory_proj_writer is the same question without the low-rank
+        # constraint: the memory write gets its own full projection, seeded from
+        # the generation one by the init checkpoint.
+        self.memory_proj_writer = memory_proj_writer
         self.memory_lora_writer = memory_lora_writer
         self.ema_memory = ema_memory
         self.decoupled_memory = decoupled_memory
-        if is_causal and memory_lora_writer:
+        if is_causal and memory_proj_writer:
+            # W_mem is absent from any pretrained checkpoint, so the
+            # meta-device fast path cannot be used.
+            self.model = MemoryProjWanModel.from_pretrained(
+                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size,
+                low_cpu_mem_usage=False, device_map=None)
+        elif is_causal and memory_lora_writer:
             # dW is absent from any pretrained checkpoint, so the meta-device
             # fast path (which refuses to leave a key uninitialised) cannot be
             # used.
@@ -297,7 +309,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             # untouched -- they never see these keys.
             extra = {}
             if memory_lora_write:
-                if not self.memory_lora_writer:
+                if not (self.memory_lora_writer or self.memory_proj_writer):
                     raise ValueError(
                         "memory_lora_write requires the memory-LoRA model; set "
                         "model_kwargs.memory_lora_writer=true in the config.")

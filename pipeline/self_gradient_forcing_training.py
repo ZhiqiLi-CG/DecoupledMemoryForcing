@@ -23,7 +23,7 @@ class SelfGradientForcingTrainingPipeline:
     # difference lives inside the model's attention, not here.
     GRAD_MODES = ("self_gradient_forcing", "self_forcing", "self_forcing_no_sg",
                   "memory_decoupling_forcing", "ema_memory_forcing",
-                  "memory_lora_forcing")
+                  "memory_lora_forcing", "memory_proj_forcing")
 
     def __init__(
         self,
@@ -57,7 +57,8 @@ class SelfGradientForcingTrainingPipeline:
         # Marks the pass-1 refresh as the memory write so it takes the
         # writer's projection; pass 2 needs no mark, its clean/noisy split
         # already separates the two roles.
-        self.memory_lora_writer = (grad_mode == "memory_lora_forcing")
+        self.memory_lora_writer = grad_mode in ("memory_lora_forcing",
+                                                "memory_proj_forcing")
 
         self.scheduler = scheduler
         self.generator = generator
@@ -135,7 +136,7 @@ class SelfGradientForcingTrainingPipeline:
         **conditional_dict,
     ) -> torch.Tensor:
         if self.grad_mode in ("self_gradient_forcing", "ema_memory_forcing",
-                              "memory_lora_forcing"):
+                              "memory_lora_forcing", "memory_proj_forcing"):
             return self._self_gradient_forcing_inference(
                 noise=noise,
                 clean_image_or_video=clean_image_or_video,

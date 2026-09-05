@@ -33,6 +33,7 @@ from pipeline import (
 from pipeline.decoupled_memory_inference import DecoupledMemoryInferencePipeline
 from pipeline.ema_memory_inference import EMAMemoryInferencePipeline
 from pipeline.memory_lora_inference import MemoryLoRAInferencePipeline
+from pipeline.memory_proj_inference import MemoryProjInferencePipeline
 from utils.dataset import TextDataset, TextImagePairDataset
 from utils.misc import set_seed
 
@@ -98,7 +99,9 @@ config = OmegaConf.merge(default_config, config)
 if hasattr(config, 'denoising_step_list'):
     # Few-step inference. Decoupled Memory Forcing needs its own pipeline: the
     # cache refresh must go through the memory adapter it was trained with.
-    if getattr(getattr(config, "model_kwargs", {}), "memory_lora_writer", False):
+    if getattr(getattr(config, "model_kwargs", {}), "memory_proj_writer", False):
+        pipeline = MemoryProjInferencePipeline(config, device=device)
+    elif getattr(getattr(config, "model_kwargs", {}), "memory_lora_writer", False):
         pipeline = MemoryLoRAInferencePipeline(config, device=device)
     elif getattr(getattr(config, "model_kwargs", {}), "ema_memory", False):
         # The EMA model must mark its cache refresh, or the cache would hold raw
