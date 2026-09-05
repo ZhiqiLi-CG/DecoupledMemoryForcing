@@ -312,7 +312,7 @@ class MemoryLoRAInferencePipeline(torch.nn.Module):
                 current_start=current_start_frame * self.frame_seq_length,
                 # This forward writes memory, so it takes the writer's
                 # projection. The denoising forwards above keep W.
-                memory_write=True,
+                memory_lora_write=True,
             )
 
             if profile:
