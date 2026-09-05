@@ -406,7 +406,8 @@ class EMASinkInferencePipeline(torch.nn.Module):
             # Only meaningful while streaming: without eviction nothing is ever
             # folded in, and the sink behaves exactly as it always did.
             sa.ema_sink = long_video and getattr(self, "ema_sink", True)
-            sa.ema_sink_beta = getattr(self, "ema_sink_beta", 0.9)
+            sa.ema_sink_beta = getattr(self, "ema_sink_beta", 9e-3)
+            sa.ema_sink_rotate = getattr(self, "ema_sink_rotate", False)
             sa.kv_cache_train_frames = kv_cache_train_frames
             sa.kv_cache_position_mode = kv_cache_position_mode
 

@@ -165,7 +165,17 @@ class EMASinkSelfAttention(nn.Module):
         self.kv_cache_position_mode = "top_aligned"
         # Off by default: with ema_sink False this model is the causal one.
         self.ema_sink = False
-        self.ema_sink_beta = 0.9
+        # Reward Forcing's alpha: S <- alpha*S + (1-alpha)*K_evicted, alpha=9e-3.
+        # Small on purpose -- the sink then holds approximately the frame that
+        # just left the window, which is a REAL frame's K/V and therefore in the
+        # distribution the model was trained on. A large alpha turns the sink
+        # into an average of many frames, which the model has never seen; that
+        # is what the paper's own alpha=0.9 ablation rejects.
+        self.ema_sink_beta = 9e-3
+        # The paper keeps ONE sink state. Folding into every slot keeps them all
+        # equal, i.e. one logical sink, while leaving the attention geometry
+        # identical to the plain-sink baseline it is compared against.
+        self.ema_sink_rotate = False
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -321,16 +331,18 @@ class EMASinkSelfAttention(nn.Module):
                         beta = self.ema_sink_beta
                         nxt = int(kv_cache.get("ema_sink_next", 0))
                         for j in range(num_evict):
-                            slot = (nxt + j) % sink
-                            s_lo, s_hi = slot * fs, (slot + 1) * fs
-                            e_lo = (sink + j) * fs
-                            e_hi = e_lo + fs
-                            kv_cache["k"][:, s_lo:s_hi] = (
-                                beta * kv_cache["k"][:, s_lo:s_hi]
-                                + (1 - beta) * kv_cache["k"][:, e_lo:e_hi])
-                            kv_cache["v"][:, s_lo:s_hi] = (
-                                beta * kv_cache["v"][:, s_lo:s_hi]
-                                + (1 - beta) * kv_cache["v"][:, e_lo:e_hi])
+                            slots = ([(nxt + j) % sink] if self.ema_sink_rotate
+                                     else list(range(sink)))
+                            for slot in slots:
+                              s_lo, s_hi = slot * fs, (slot + 1) * fs
+                              e_lo = (sink + j) * fs
+                              e_hi = e_lo + fs
+                              kv_cache["k"][:, s_lo:s_hi] = (
+                                  beta * kv_cache["k"][:, s_lo:s_hi]
+                                  + (1 - beta) * kv_cache["k"][:, e_lo:e_hi])
+                              kv_cache["v"][:, s_lo:s_hi] = (
+                                  beta * kv_cache["v"][:, s_lo:s_hi]
+                                  + (1 - beta) * kv_cache["v"][:, e_lo:e_hi])
                         kv_cache["ema_sink_next"] = (nxt + num_evict) % sink
                     src_lo = (sink + num_evict) * fs
                     src_hi = len(abs_list) * fs

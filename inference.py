@@ -102,7 +102,8 @@ if hasattr(config, 'denoising_step_list'):
     # cache refresh must go through the memory adapter it was trained with.
     if getattr(getattr(config, "model_kwargs", {}), "ema_sink", False):
         pipeline = EMASinkInferencePipeline(config, device=device)
-        pipeline.ema_sink_beta = float(getattr(config, "ema_sink_beta", 0.9))
+        pipeline.ema_sink_beta = float(getattr(config, "ema_sink_beta", 9e-3))
+        pipeline.ema_sink_rotate = bool(getattr(config, "ema_sink_rotate", False))
     elif getattr(getattr(config, "model_kwargs", {}), "memory_proj_writer", False):
         pipeline = MemoryProjInferencePipeline(config, device=device)
     elif getattr(getattr(config, "model_kwargs", {}), "memory_lora_writer", False):
