@@ -5,6 +5,7 @@ import torch.distributed as dist
 import torch
 
 from pipeline import SelfGradientForcingTrainingPipeline, TeacherForcingTrainingPipeline, BidirectionalTrainingPipeline
+from pipeline.persistent_kv_training import PersistentKVTrainingPipeline
 from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
@@ -232,6 +233,29 @@ class SelfGradientForcingModel(BaseModel):
         Here we encapsulate the inference code with a model-dependent outside function.
         We pass our FSDP-wrapped modules into the pipeline to save memory.
         """
+        # One-pass Self Gradient Forcing: the rollout itself carries the
+        # gradient, so there is no second teacher-forced pass. Verified to
+        # reproduce this pipeline's training signal (output 3.1e-05, global
+        # parameter gradient 2.2e-04, cosine 0.99999988 -- below the 3.6e-03 /
+        # 5.4e-03 floor the two attention kernels set on identical inputs).
+        # See docs/persistent_kv_write.md.
+        if getattr(self.args, "grad_mode", "") == "persistent_kv_forcing":
+            self.inference_pipeline = PersistentKVTrainingPipeline(
+                denoising_step_list=self.denoising_step_list,
+                scheduler=self.scheduler,
+                generator=self.generator,
+                num_frame_per_block=self.num_frame_per_block,
+                num_max_frames=self.num_training_frames,
+                context_noise=self.args.context_noise,
+                per_rank_exit_step=getattr(self.args, "per_rank_exit_step", True),
+                self_gradient_forcing_match_context=getattr(
+                    self.args, "self_gradient_forcing_match_context", True),
+                self_gradient_forcing_cache_mode=getattr(
+                    self.args, "self_gradient_forcing_cache_mode", "exit"),
+                gradient_checkpointing=getattr(self.args, "gradient_checkpointing", True),
+            )
+            return
+
         self.inference_pipeline = SelfGradientForcingTrainingPipeline(
             denoising_step_list=self.denoising_step_list,
             denoising_step_list_first_chunk=self.denoising_step_list_first_chunk,

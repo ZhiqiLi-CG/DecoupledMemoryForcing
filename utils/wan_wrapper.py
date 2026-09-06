@@ -14,6 +14,7 @@ from wan.modules.ema_memory_model import EMAMemoryWanModel
 from wan.modules.memory_lora_model import MemoryLoRAWanModel
 from wan.modules.memory_proj_model import MemoryProjWanModel
 from wan.modules.ema_sink_model import EMASinkWanModel
+from wan.modules.persistent_kv_model import PersistentKVWanModel
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -129,7 +130,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             ema_memory=False,
             memory_lora_writer=False,
             memory_proj_writer=False,
-            ema_sink=False
+            ema_sink=False,
+            persistent_kv=False
     ):
         super().__init__()
 
@@ -151,6 +153,12 @@ class WanDiffusionWrapper(torch.nn.Module):
         # ema_sink changes only the streaming cache policy at inference: an
         # evicted frame is folded into the sink rather than dropped. No
         # parameters, so any causal checkpoint runs under it unchanged.
+        # persistent_kv swaps in the one-pass model, whose memory write
+        # returns immutable K/V pages instead of overwriting a cache. It is a
+        # strict superset of the causal model -- same parameters, same
+        # _forward_train -- so it loads the same pretrained weights and the
+        # teacher-forced path is unchanged. Defaults off.
+        self.persistent_kv = persistent_kv
         self.ema_sink = ema_sink
         self.memory_proj_writer = memory_proj_writer
         self.memory_lora_writer = memory_lora_writer
@@ -181,6 +189,10 @@ class WanDiffusionWrapper(torch.nn.Module):
         elif is_causal and decoupled_memory:
             self.model = DecoupledMemoryWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+        elif is_causal and persistent_kv:
+            self.model = PersistentKVWanModel.from_pretrained(
+                f"wan_models/{model_name}/", local_attn_size=local_attn_size,
+                sink_size=sink_size)
         elif is_causal:
             self.model = CausalWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
@@ -297,7 +309,16 @@ class WanDiffusionWrapper(torch.nn.Module):
         # Separated memory/generation projections: mark the forward that writes
         # memory, so it uses (W + dW) rather than W.
         memory_lora_write: bool = False,
-        memory_write_grad: bool = False  # ... and make that write differentiable
+        memory_write_grad: bool = False,  # ... and make that write differentiable
+        # One-pass persistent KV: "noisy" reads the history pages and predicts,
+        # "write" returns this frame's pages. Routed through here rather than
+        # called on self.model directly because FSDP casts and all-gathers the
+        # root module's parameters (patch_embedding among them) in ITS forward --
+        # bypassing it leaves them fp32 and sharded, which single-GPU tests never
+        # see and multi-GPU training fails on immediately.
+        persistent_mode: Optional[str] = None,
+        persistent_history=None,
+        persistent_start: int = 0
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -309,7 +330,21 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         logits = None
         # X0 prediction
-        if kv_cache is not None:
+        if persistent_mode is not None:
+            ctx = list(prompt_embeds)
+            frame = noisy_image_or_video.permute(0, 2, 1, 3, 4)
+            # self.model(...), never self.model.forward_*: under FSDP only
+            # __call__ runs the hook that gathers and casts the parameters.
+            call = dict(t=input_timestep, context=ctx,
+                        persistent_mode=persistent_mode,
+                        persistent_history=persistent_history,
+                        persistent_start=persistent_start)
+            if persistent_mode == "write":
+                # pages, not a prediction: no head, nothing to convert
+                return self.model(frame, **call)
+            assert persistent_mode == "noisy", persistent_mode
+            flow_pred = self.model(frame, **call).permute(0, 2, 1, 3, 4)
+        elif kv_cache is not None:
             if memory_write != "none" and not self.decoupled_memory:
                 raise ValueError(
                     "memory_write=%r requires the Decoupled Memory model; set "
