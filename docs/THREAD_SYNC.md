@@ -459,3 +459,9 @@ loss 四位一致 → 噪声流、退出步、critic 时间步完全同步;grad_
 **@1000(用户要求追加):** 5s SGF 18.80 / PKV **15.48**;60s SGF 16.82 / PKV 16.33。
 5s 曲线:SGF 10.2 → 7.0 → 19.3 → 18.8;PKV 25.2 → 13.1 → 20.4 → 15.5(@50/200/750/1000)。**750 步后交叉,1000 步 PKV 反而更低。**
 结合同种子 50 步对照与三路审计:早期 2× 差异是轨迹的随机波动,不是 pipeline 的系统性偏移。
+
+**共享文件的两处改动(用户已批准;批准前状态存于 commit 3e61bd4 与 /mnt/data/zhaofeng/runs/sgf/backup_pre_shared_edit_0906_2026/):**
+- `model/base.py`:给 `PersistentKVTrainingPipeline` 传 `last_step_only=self.args.last_step_only`(与参考 pipeline 一致)。
+- `pipeline/causal_inference.py`:构造采样器前从 `model_kwargs` 去掉 `persistent_kv`,推理永远用 `CausalWanModel`。
+验证(GPU):cfg_pkv.yaml → 推理类 CausalWanModel、训练 wrapper 仍 PersistentKVWanModel;pkv@1000 与 sgf@1000 的 ckpt(825 个张量,全部带 FSDP 前缀)去前缀后 **strict=True** 加载进 CausalWanModel 均 0 缺失 0 多余;inference.py 端到端生成通过。
+附带发现(参考实现原有):inference.py 的回退路径去前缀后用 strict=False 加载,键不匹配会被静默跳过;上面的 strict=True 结果说明当前两类 ckpt 都没有这个问题。

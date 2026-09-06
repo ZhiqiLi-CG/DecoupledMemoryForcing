@@ -245,6 +245,7 @@ class SelfGradientForcingModel(BaseModel):
                 scheduler=self.scheduler,
                 generator=self.generator,
                 num_frame_per_block=self.num_frame_per_block,
+                last_step_only=self.args.last_step_only,
                 num_max_frames=self.num_training_frames,
                 context_noise=self.args.context_noise,
                 per_rank_exit_step=getattr(self.args, "per_rank_exit_step", True),

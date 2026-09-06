@@ -18,8 +18,15 @@ class CausalInferencePipeline(torch.nn.Module):
     ):
         super().__init__()
         # Step 1: Initialize all models
+        # `persistent_kv` selects the one-pass TRAINING model. Sampling always
+        # runs the reference CausalWanModel: the two share every parameter name
+        # and the whole inference forward, so a training config must not decide
+        # which class samples. Dropped here, where every inference entry point
+        # (inference.py, demo.py, infer_long_chunked.py) builds its generator.
+        model_kwargs = dict(getattr(args, "model_kwargs", {}))
+        model_kwargs.pop("persistent_kv", None)
         self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
+            **model_kwargs, is_causal=True) if generator is None else generator
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
         self.vae = WanVAEWrapper() if vae is None else vae
 
