@@ -162,6 +162,20 @@ class PersistentKVTrainingPipeline:
         # test_window_covers_all.py: 0 differing entries; at 24 frames they
         # differ in 192). Past that point training would silently run on a
         # different attention pattern, so refuse instead.
+        # Chunkwise is untested, so it is refused rather than run. In SGF's
+        # teacher-forcing mask a clean token sees the other clean tokens of its
+        # OWN block (causal_model.py, context_ends = the block's end); here the
+        # block is written in one call and intra-block visibility is whatever
+        # forward_clean_writer does. At num_frame_per_block=1 the two cannot
+        # differ, which is exactly why every green light so far says nothing
+        # about num_frame_per_block>1.
+        if self.num_frame_per_block != 1:
+            raise ValueError(
+                "persistent-KV is only verified for num_frame_per_block=1; got "
+                "%d. Chunkwise intra-block visibility has no test against SGF's "
+                "mask, so it would run silently on a different attention "
+                "pattern." % self.num_frame_per_block)
+
         local = getattr(model, "local_attn_size", -1)
         sink = getattr(model, "sink_size", 0)
         if local != -1 and num_frames > local + sink:

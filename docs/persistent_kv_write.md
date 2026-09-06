@@ -239,3 +239,31 @@ mask 相同意味着**没有任何 key 被丢弃 —— 窗口在这个长度上
 不存在,没有东西可验证。一旦帧数 > `local_attn_size + sink_size`,eviction 就会
 真正发生,届时必须先实现 window/sink 再单独验证。pipeline 里已有硬断言,
 越界时直接抛错而不是静默降级。
+
+## 9. 每个验证覆盖了什么(S9:绿灯不会自己外推)
+
+一个通过的测试只对它实际跑过的 (设备数, 抽象层, 配置) 有效。这份表把覆盖范围写出来,
+免得下次再出现「pipeline 级单卡全绿、4 卡 DMD 级崩掉」时找不到缺口在哪。
+
+| 验证 | 设备 | 抽象层 | num_frame_per_block |
+|---|---|---|---|
+| 前向 vs cached 串行 | 1 | 模型 | 1 |
+| checkpoint 精确性 | 1 | 模型 | 1 |
+| RoPE 对齐 | 1 | 算子 | 1 |
+| kernel / bf16 地板 | 1 | 算子 | — |
+| 严格梯度(4 种精度×FSDP 组合) | 1 | 模型 | 1 |
+| pipeline vs SGF pass2 | 1 | pipeline | 1 |
+| 集成 1–3(真实 DMD) | 1 | 训练步 | 1 |
+| 50 步冒烟 | **8** | 训练循环 | 1 |
+
+**已知的零覆盖:**
+
+- **`num_frame_per_block > 1`(chunkwise)** —— SGF 的 TF mask 里 clean token 对自己
+  block 内其它 clean token 可见,而这里整块一次写入、块内可见性由
+  `forward_clean_writer` 决定。block=1 时两者不可能不同,所以上表**没有一行**能外推
+  到 chunkwise。pipeline 里已加硬 guard 直接 raise。
+- **多卡下的逐 rank 行为** —— 8 卡只跑过 50 步冒烟,没有做过 per-rank 的 |g| / cos
+  比对(S4b)。`per_rank_exit_step: true` 时各 rank 各采 exit step,聚合值可能被
+  单个 rank 的异常主导。
+- **page 的跨 step 生命周期** —— 70+ 步训练无 OOM 是间接证据,但没有直接测过
+  `PersistentKVStore` 的 page 是否在 optimizer step 前被图持有(S10)。
