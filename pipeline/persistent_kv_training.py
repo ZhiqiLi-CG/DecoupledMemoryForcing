@@ -48,6 +48,19 @@ class PersistentKVTrainingPipeline:
         **kwargs,
     ):
         self.denoising_step_list = denoising_step_list
+        # Same two constructor guards as SelfGradientForcingTrainingPipeline.
+        # They are inert under the shipped config (warped list has no trailing
+        # 0; cache_mode is 'exit') but without them a config change would make
+        # the two pipelines diverge silently: the reference would drop a final
+        # t=0 step and refuse an unknown cache mode, this one would run a 5th
+        # denoise at t=0 / fall into an undefined hybrid.
+        if self.denoising_step_list[-1] == 0:
+            self.denoising_step_list = self.denoising_step_list[:-1]
+        if self_gradient_forcing_cache_mode not in ("exit", "final_clean"):
+            raise ValueError(
+                "self_gradient_forcing_cache_mode must be 'exit' or 'final_clean'. "
+                f"Got {self_gradient_forcing_cache_mode!r}."
+            )
         self.scheduler = scheduler
         self.generator = generator
         self.num_frame_per_block = num_frame_per_block
@@ -158,9 +171,10 @@ class PersistentKVTrainingPipeline:
         # forward_persistent attends to EVERY page: it has no window and no sink
         # yet. That is exactly equivalent to the config's (sink, window) only
         # while the two together already cover the whole clip. At 21 frames with
-        # sink=3, window=18 the masks are bit-identical (verified,
-        # test_window_covers_all.py: 0 differing entries; at 24 frames they
-        # differ in 192). Past that point training would silently run on a
+        # sink=3, window=18 the masks are bit-identical (verified by
+        # /mnt/data/zhaofeng/runs/sgf/tests/test_window_covers_all.py, kept
+        # outside the repo with the other one-pass tests: 0 differing entries;
+        # at 24 frames they differ in 192). Past that point training would silently run on a
         # different attention pattern, so refuse instead.
         # Chunkwise is untested, so it is refused rather than run. In SGF's
         # teacher-forcing mask a clean token sees the other clean tokens of its

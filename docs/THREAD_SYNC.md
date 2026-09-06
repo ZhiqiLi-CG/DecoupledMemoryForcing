@@ -261,3 +261,201 @@ pipeline 侧 `checkpoint_inside_model=True` 时不再在帧级 checkpoint。
 
 - SGF2 的建议 → **`docs/SGF2_REVIEW.md`**
 - A 的逐条回应与实验结果 → **`docs/SGF2_REBUTTAL.md`**
+
+
+---
+
+# 第二轮:一趟法训出来的模型和 SGF 行为不同(2026-09-06 下午)
+
+**现象(用户观察,已量化):PKV 生成的视频"动得太快"。**
+
+相邻帧差 `mean |frame[t] - frame[t-1]|`(0–255):
+
+| | step200 5s | step200 60s | step500 60s |
+|---|---|---|---|
+| sgf | 7.04 | 4.11 | 13.74 |
+| **pkv** | **13.09** | **16.30** | **26.90** |
+
+**约 2 倍,且持续存在**(两者都随训练增长,PKV 始终约 2×)。
+差异在**前 21 帧内就存在**(12.4 vs 7.7)—— 训练视野之内,不是长视频外推的问题。
+
+注意:这个指标测的**不是语义运动**。mem_lora 在此为 SGF 的 5–6 倍,但它的 VBench
+`dynamic_degree` 反而更低(0.3048 vs 0.4098)。所以更可能是**逐帧噪声/不稳定**。
+
+## 已排除的(每条都有实测,全部通过)
+
+| 假设 | 结果 |
+|---|---|
+| 单步梯度不等价 | cos 0.9999761,ΔθAdamW cos 0.9996491 |
+| 多步累积 / page 泄漏 | 30 步余弦变化 3e-9;weakref 每步全释放 |
+| 多卡梯度聚合 | 真实配置(hybrid_full + 5e7 + 8 rank)最差 cos 0.9999949 |
+| lr 不匹配 | 两边相同,trainer 无 world_size 缩放 |
+| EMA 存档损坏 | 825 张量完整;且 step200 非 EMA 也异常 |
+| 推理路径与 causal 不同 | 逐位相同(含流式 cache) |
+| 推理精度错位 | `inference.py` 硬编码 bf16,与 config 无关 |
+| **训练/推理路径错位** | page vs cache 在**真实配置**(21帧/local=18/sink=3/bf16)下 **0.000e+00** |
+| **critic 的 no_grad 分支与 generator 不一致** | 同 pipeline 两种模式输出 **0.000e+00** |
+| chunkwise | 已 guard 拒绝 |
+
+## 我自己三个测量之间的矛盾(正在查,这是当前主线)
+
+```
+喂相同记录张量给两条 arm     3.4e-05
+各自跑各自的 rollout        1.4e-02      ← 400 倍
+page 路径 vs cache 路径     0.000e+00
+```
+
+rollout 路径逐位相同、RNG 抽取次数也相同(每块 3 次去噪 randn + 1 次 context
+randn,两边核对过),那 1.4% 只能来自 **rollout 交给可微前向的张量本身**
+(`noisy_at_t` / `x_ctx`)。而那正是模型训练的对象 —— **任何"喂相同输入比梯度"的
+检查都永远看不到这种差异。**
+
+`test_rollout_products.py` 正在直接比这两个张量。
+
+## 已知的、未排除的配置差异
+
+PKV 用 1×8,SGF baseline 用 2×4(有效 batch 都是 8)。
+`per_rank_exit_step: true` 下每 rank 各采 exit step,所以一个 batch 里
+SGF 有 4 个不同 exit step、PKV 有 8 个。用户认为这不足以造成 2 倍,我同意,
+但它是目前**唯一**已知未排除的系统性差异。
+
+## 想请 SGF2 看的
+
+1. 上面那个 400 倍的矛盾,你看是哪一端的测量有问题?
+2. 还有什么"系统性、单向"的机制能让每步梯度等价、却让训出来的模型持续更噪?
+3. `pipeline/persistent_kv_training.py` 里 no_grad rollout 与可微部分的边界,
+   和 `self_gradient_forcing_training.py` 的 `_self_gradient_forcing_inference`
+   逐行对照,有没有我漏掉的语义差异(我的 pipeline 忽略了 SGF pipeline 接收的
+   `same_step_across_blocks` / `independent_first_frame` /
+   `denoising_step_list_first_chunk`,当前 config 都没设)。
+
+
+### 第二轮进展(续)
+
+**400 倍矛盾已解决 —— 是我测试 spy 的 bug。** `_noisy` 每块被调 5 次(4 去噪 + 1 可微),
+我取了末尾 21 个混入了中间态。修正后:`noisy_at_t` **0.000e+00**,`x_ctx` **0.000e+00**,
+final output 2.484e-03(= bf16 kernel 地板)。**同权重同 seed 下两条 pipeline 逐位等价。**
+
+**init 基线拿到了,现象坐实且是双向的:**
+
+| | 5s 相邻帧差 | 前 21 帧 |
+|---|---|---|
+| init (causal_cd.pt) | 8.72 | 11.20 |
+| sgf @200 | 7.04 ↓ | 7.72 ↓ |
+| pkv @200 | 13.09 ↑ | 12.44 |
+
+SGF 训练把逐帧变化压低,PKV 把它推高。**两个模型朝相反方向离开了同一个起点。**
+
+**权重空间**:cos(d_sgf, d_pkv) 0.25–0.30,幅度比 1.13×,各参数组均匀。
+但两次长训练数据顺序本就不同(2×4 vs 1×8),这个数**不具判别力**。
+
+**决定性实验正在跑(630226):** SGF 用与 PKV **完全相同**的配置(1×8、seed 0、
+causal_cd.pt、同 config 只差 grad_mode)训 50 步,与 `logs_pkv/checkpoint_model_000050`
+直接比权重。这是唯一把 pipeline 单独隔离出来的实验:
+- 位移 cos ≈ 1、幅度 ≈ 1 → 算法等价,1500 步的差异是混沌 + 数据顺序
+- 明显分开 → 存在系统性机制,且 50 步内可复现,可二分
+
+**已排除新增**:训练/推理路径错位(真实配置 0.000e+00)、critic no_grad 分支
+(0.000e+00)、rollout 产物(0.000e+00)。
+
+**用户的类比值得记录**:现象"像 MemProj"(记忆写入与生成分开用 W 的那次)。
+共用 W 却表现如分开 W,提示某处让写入表征与读取表征脱钩。源码审阅
+`forward_clean_writer` / `forward_noisy_frame` 未发现,数值上也逐位一致。
+
+---
+
+## 第三轮(09-06 18:00)— 上面那个"决定性实验"的前提是错的,已重新设计
+
+**发现:`seed: 0` 在这个 trainer 里不是种子,是"随机抽一个种子"**
+(`trainer/distillation.py:36-39`:`if config.seed == 0: random_seed = torch.randint(...)`,且不打印)。
+所以 `logs_pkv` 与 `logs_sgf_1x8_s0` 的噪声流、退出步、critic 时间步从 step 0 起就不同。
+证据:两条 run 的 **step 1(critic 步,权重仍完全相同)** critic_loss 0.0172 vs 0.0188、
+grad_norm 0.406 vs 0.263 —— 权重一样、算法逐位等价,只能是随机流不同。
+**数据顺序仍然相同**:`DistributedSampler` 用默认 seed 构造,不依赖 `config.seed`。
+
+因此 630226 的对比降级为"不同种子、不同 pipeline",cos 低不能归因于 pipeline。
+
+**重新设计成 2×2(pipeline × seed),50 步:**
+
+| | seed 随机 | seed = 1 |
+|---|---|---|
+| SGF | `logs_sgf_1x8_s0`(630226,已到 50) | `logs_sgf_1x8_s1`(630239) |
+| PKV | `logs_pkv`@50(629727) | `logs_pkv_1x8_s1_50`(630242) |
+
+判据(`tests/compare_traj_matrix.py`,等四个 ckpt 齐后由 630244 自动跑):
+- cos(SGF_s1, PKV_s1):同种子、只差 pipeline
+- cos(SGF_r, SGF_s1)、cos(PKV_r, PKV_s1):同 pipeline、只差种子 —— 混沌地板
+- 前者 ≥ 后两者 → 50 步窗口内种子解释一切;明显更低 → pipeline 在推权重,可二分。
+另附:seed=1 两条 run 的 step-1 critic_loss 若一致到 1e-3,说明两条 pipeline 的 RNG 消耗同步;
+不一致则说明消耗次数不同(即使值等价),这本身就是要修的。
+
+**对 S5(B→B)**:推理本就不是逐位确定的(同权重同 seed 8/8 不同,像素差 1.93),训练 B→B 也不会逐位相同;
+上面的 2×2 用"同 pipeline 不同种子"给出噪声地板,替代逐位复现。
+**对 S6**:已在代码里对齐(rank-0 抽 + broadcast + last_step_only,见 `persistent_kv_training.py:108-131` docstring);
+当前配置走 `per_rank_exit_step` 分支,两边都是每 rank 各抽 size=(1,)。
+
+**fp32 假设(用户提问)**:否。bf16 无 FSDP 那格 rel 5.2e-03 但 cos 1.0000000,是纯标量差,
+Adam 不敏感,master/优化器/ckpt 都是 fp32;且两条 pipeline 用同一套混合精度,精度不是差异变量。
+
+**60s@200 起点数据**:init 10.50 → SGF 4.11(↓)、PKV 16.30(↑)。方向相反,不是"多一点"。
+
+**240s VBench**:SGF 的 imaging_quality / temporal_flickering 两个补测同秒启动,都对同一
+`split_clip/` 重切(`split_video_into_clips` 每次重写、不跳过),互相读到半写的 clip → 假"坏文件"。
+temporal_flickering 已成,imaging_quality 单独重跑(630237)。以后同一 videos 目录的维度必须串行。
+
+**630226 结果(随机种子对随机种子,仅供参考,已被 2×2 取代):**
+cos(d_sgf, d_pkv) = 0.233,|d_pkv|/|d_sgf| = 0.974,|d|/|θ| 均 ≈ 1.85e-4 —— 位移幅度相同、方向几乎不相关。
+**行为(5s,同 8 条 prompt,推理 seed 0):** init 8.72 → sgf_1x8@50 **10.23**,pkv@50 **25.16**。
+PKV 在 50 步内把逐帧变化推到起点的 3×,SGF 基本没动。位移幅度一样、效果差 3× → 权重动的方向不同。
+
+**步 750(5s):** sgf 19.29,pkv 20.36 —— 到 750 步两者**几乎一样**。SGF 也会走到这个闪烁水平,只是慢得多
+(sgf: 8.7 → 7.0@200 → 19.3@750;pkv: 8.7 → 25.2@50 → 13.1@200 → 20.4@750)。
+所以现象不是"PKV 多闪一倍",更像"PKV 在训练早期就跳进 SGF 要几百步才到的区域"。
+
+**seed=1 两臂的 RNG 同步性(权重相同的前几步):**
+step 1 critic_loss SGF 0.0525 / PKV 0.0525,grad_norm 0.1739 / 0.1728;step 2 0.0889 / 0.0889,0.2910 / 0.2847。
+loss 四位一致 → 噪声流、退出步、critic 时间步完全同步;grad_norm 差 0.6–2% 是 bf16 地板(两条 pipeline 生成结果差 2.5e-3)。
+所以 cos(SGF_s1, PKV_s1) 只剩两个来源:pipeline 本身,或 bf16 地板被混沌放大 —— 后者的大小由同 pipeline 换种子那两格标定。
+
+**60s 全程(相邻帧差,init 10.50):** @200 SGF 4.11 / PKV 16.30(4×)→ @500 13.74 / 26.90(2×)→ @750 **19.64 / 21.82(1.1×)**。
+两条曲线在 750 步汇合。差的是**到达时间**,不是终点。
+
+**seed=1 两臂生成器步(同噪声流):** step 6 gl 0.1065/0.1054;11 0.1085/0.1100;16 **0.2914/0.1243**;21 0.1594/0.1975;26 0.2850/0.2816;31 0.0889/0.0926。
+只经过两次生成器更新(lr 2e-6)之后同一样本的 loss 就能差 2.3×,随后又靠回 —— 单步 loss 对权重极敏感,这就是需要换种子臂标定混沌地板的原因。
+
+**2×2 结果(50 步):**
+
+权重位移 cos:换种子 → 0.199(SGF)/ 0.226(PKV)/ 0.233(跨);同种子换 pipeline → **0.675**。四臂 |d|/|θ| 均 1.8e-4。
+行为(5s 相邻帧差,推理 seed 0,init 8.72):
+
+| | 随机 seed | seed = 1 |
+|---|---|---|
+| SGF | 10.23 | 13.65 |
+| PKV | 25.16(重新生成 25.16,来源无误) | 14.95 |
+
+**同种子下两条 pipeline 在 50 步既在权重上远近于种子差,行为上也只差 10%。**
+之前看到的 pkv@50 = 25 是随机种子那条 run 的个体行为(SGF 换种子也从 10.2 变到 13.6)。
+这在 50 步窗口内排除了"pipeline 系统性推高运动"的假设;但 n=2/格,且只覆盖 50 步。
+用户要求逐行代码审计(pipeline 语义 / 模型 attention-page 路径 / wrapper-base-trainer 接线),进行中。
+
+## 逐行代码审计(09-06 19:00,三路并行,只读)
+
+用户要求不接受统计等价、要逐行查实现。三路各自独立读代码并给出 file:line 对照,结论:
+**在当前配置实际走到的每一条路径上,没有 BUG 级差异。** 已核对为一致的项(均有双方行号):
+
+- **pipeline 语义**:帧数(base.py 抽 21 固定)、退出步 randint 形状/范围、每步时间步、随机数调用次数与顺序(1 randint + 每帧 (S-1)+1 randn_like)、exit 捕获点、输出定义(noisy_at_t 在 train_t 上带梯度重算 x0)、x0_cache=x0_exit、x_ctx 的 t=0 加噪、writer 时间步、返回元组与 `denoised_timestep_from/to` 算式(且 `ts_schedule: false` 下该值根本未被使用)、critic no_grad 下的分支。
+- **模型层**:可见集合逐 i 推导(TF mask / cache 读 / persistent)在 i=0..20 完全同集、i=21 才分叉、guard 在 22 帧拒绝;RoPE 绝对位置与频率表;K/V 顺序(norm→rope,V 不 rope)与 dtype;时间步调制 e0 形状;page 无 detach/no_grad/原地写;`_maybe_ckpt` 捕获的 history 不被后续 append 修改;LoRA 未构造;dispatch 无静默回落;参数集合与顺序一致(state_dict 键相同)。
+- **接线**:wrapper 的 timestep/context/permute/flow→x0 转换与 kv_cache 分支同源(同一段代码 `:411-415`);模型构造 kwargs 一致;optimizer 参数组、EMA、grad clip、FSDP 单元边界与 grad_mode 无关;`gradient_mask` 由 base.py 按帧数算,21 帧下恒为 None。
+
+**审计发现的非 BUG 项(已处理/待处理):**
+1. `persistent_kv: true` 在**推理**时也会让 `CausalInferencePipeline` 构造 `PersistentKVWanModel`(pipeline/causal_inference.py:21 直接用 model_kwargs)。共享代码 diff 为零、我们此前实测推理输出逐位相同,所以数值上无影响;但"推理不受影响"只在字面上成立于不含该 flag 的 config。要彻底满足字面要求需在推理侧忽略该 flag(改共享文件,待用户批准)。
+2. 参考 pipeline 的两条构造期 guard(去掉 `denoising_step_list` 末尾 0;校验 cache_mode)我们的 pipeline 没有 → **已补齐**(仅 guard,不改算法;当前配置下无影响)。
+3. `last_step_only`:base.py 没把它传给我们的 pipeline(参考 pipeline 收到)。当前配置走 per_rank 分支,两边都不读它;若关掉 per_rank_exit_step 就会分叉。修法是 base.py 一行传参(共享文件,待批准)。
+4. 配置头注释声称"只差两行"但 generator_ckpt 有意改成 causal_cd.pt → 注释已改正,并注明 seed 0 = 随机。
+5. 注释引用的 `test_window_covers_all.py` 在仓库外(/mnt/data/zhaofeng/runs/sgf/tests/)→ 注释已改成完整路径。
+6. 副发现(两种方法同等受影响):21 帧、local 18 + sink 3 下三套可见规则都退化为**全因果注意力**,训练里 window/sink 实际没生效;推理 cache 只有 18 帧、在 i=18..20 会丢帧 3..5 —— 这是参考实现本来就有的训练/推理错位,PKV 原样继承。
+7. 梯度路径 kernel:我们用 flash-attn 反向(默认非确定性 dK/dV 累加),SGF 二趟用 flex_attention → 3.6e-3 的 run-to-run 噪声,不是偏差。
+
+**@1000(用户要求追加):** 5s SGF 18.80 / PKV **15.48**;60s SGF 16.82 / PKV 16.33。
+5s 曲线:SGF 10.2 → 7.0 → 19.3 → 18.8;PKV 25.2 → 13.1 → 20.4 → 15.5(@50/200/750/1000)。**750 步后交叉,1000 步 PKV 反而更低。**
+结合同种子 50 步对照与三路审计:早期 2× 差异是轨迹的随机波动,不是 pipeline 的系统性偏移。

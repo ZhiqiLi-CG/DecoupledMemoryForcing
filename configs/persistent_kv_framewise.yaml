@@ -1,8 +1,11 @@
 # One-pass Self Gradient Forcing (persistent differentiable KV write).
 #
 # Identical to self_gradient_forcing_framewise.yaml apart from the two lines
-# that select the one-pass path, so any difference in the run is the algorithm
-# and not the recipe.
+# that select the one-pass path (grad_mode, model_kwargs.persistent_kv) and
+# generator_ckpt, which is deliberately causal_cd.pt (see below) so the run is
+# comparable with the cd baselines rather than with the repo template.
+# NOTE: seed 0 means "draw a random seed" in trainer/distillation.py; for a
+# controlled A/B against SGF set the same nonzero seed in both configs.
 #
 # local_attn_size 18 + sink_size 3 = 21 = image_or_video_shape[1]. That is not a
 # coincidence and it must stay true: forward_persistent attends to all history,
