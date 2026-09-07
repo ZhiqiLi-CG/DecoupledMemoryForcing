@@ -465,3 +465,142 @@ loss 四位一致 → 噪声流、退出步、critic 时间步完全同步;grad_
 - `pipeline/causal_inference.py`:构造采样器前从 `model_kwargs` 去掉 `persistent_kv`,推理永远用 `CausalWanModel`。
 验证(GPU):cfg_pkv.yaml → 推理类 CausalWanModel、训练 wrapper 仍 PersistentKVWanModel;pkv@1000 与 sgf@1000 的 ckpt(825 个张量,全部带 FSDP 前缀)去前缀后 **strict=True** 加载进 CausalWanModel 均 0 缺失 0 多余;inference.py 端到端生成通过。
 附带发现(参考实现原有):inference.py 的回退路径去前缀后用 strict=False 加载,键不匹配会被静默跳过;上面的 strict=True 结果说明当前两类 ckpt 都没有这个问题。
+
+**@1300:** 5s SGF 11.21 / PKV 12.25;60s 9.70 / 11.34 —— 两者都回落到起点附近,差 10–17%。
+
+## KVForcing(09-06 晚)— 用户要求的可开源干净仓库
+
+位置 `causal/KVForcing`。基底 = 本仓库第一次提交(上游 Causal-Forcing + sink/window + 长视频推理),去掉两趟 pipeline 与所有实验副本。
+- 一趟算法不再是 1600 行的模型副本:page store 与两条 persistent 前向以 `# ======== ours ========` 标记插入 `causal_model.py`
+  的 attention / block / model 三层;同一个类既训练又推理,`persistent_kv` 开关、wrapper 换类、推理侧去 flag 全部消失。
+- `pipeline/kv_forcing_training.py`(ours)、`pipeline/self_forcing_training.py`(sf 与 no_sg 合成一个 rollout,只差 stop-gradient),
+  `grad_mode ∈ {self_forcing, self_forcing_no_sg, kv_forcing}`;配置键 `match_context` / `cache_mode` / `per_rank_exit_step`。
+- 检测(全部在仓库外 `/mnt/data/zhaofeng/runs/sgf/kvtests/`):小模型 page==cache 0.000e+00、checkpoint 精确、梯度可达 ✔;
+  进行中:tiny 跨仓库(新 sf/no_sg/kv_forcing vs 旧 sf/no_sg/两趟/一趟)、真实配置跨仓库单步(新 kv_forcing vs 旧两趟 SGF)、
+  8 卡逐 rank(hybrid_full/full)、50 步 1×8 seed 1 训练对照(vs 旧 logs_pkv_1x8_s1_50 / logs_sgf_1x8_s1)。
+
+**KVForcing 检测结果(仓库外 kvtests/,对照臂各在独立进程,同种子):**
+- tiny(6 层、21 帧、fp32):新 sf vs 旧 sf grad rel 4.1e-08 cos 1.0000000000;新 no_sg vs 旧 no_sg rel 1.2e-05 cos 0.9999999999;
+  新 kv_forcing vs 旧两趟 SGF rel 2.4e-04 cos 0.99999997(flash vs flex 内核);新 kv_forcing vs 旧一趟 rel 2.0e-06 cos 1.0000000000;
+  对照组 sf vs kv_forcing cos 0.9936 rel 0.11 —— 测试能分辨 stop-gradient 与全梯度。
+- 真实配置(1.3B、21 帧、bf16 FSDP、三模型同卡):新 kv_forcing vs 旧两趟 SGF loss rel 1.18e-04、grad cos 0.9999761、Δθ cos 0.9996489、
+  rollout 视频差 1.4e-02(bf16 自回归漂移);与旧一趟:loss 逐位相同、grad cos 0.9999984、视频 0.000e+00、峰值 47.94 vs 47.95 GiB。
+  单步峰值(含 mask 尖峰):两趟 69.57 GiB / 一趟 47.94 GiB;fwd+bwd 20.1 s / 20.4 s。这些数字与旧实现当时测得的完全一致。
+- 8 卡逐 rank(hybrid_full 与 full):最差 cos 0.9999950,rel 3e-3。
+- 50 步 1×8 seed 1 训练:前三步 critic loss 与旧仓库同种子两臂逐位一致(0.0525 / 0.0889 / 0.0728);位移矩阵待出。
+
+**50 步位移矩阵(全部 seed 1、1×8、causal_cd.pt):**
+
+| cos | sgf(旧两趟) | pkv(旧一趟) | kvf(新一趟) | sgf 随机种子 |
+|---|---|---|---|---|
+| sgf_s1 | 1 | 0.675 | 0.633 | 0.199 |
+| pkv_s1 | | 1 | **0.658** | 0.199 |
+| kvf_s1 | | | 1 | 0.195 |
+
+新旧一趟(单步 grad cos 0.9999984、rollout 逐位相同、只差 flash-attn 反向的非确定性累加)跑 50 步后 cos 0.658 ——
+与"一趟 vs 两趟"的 0.675 同一水平。这就是 S5 要的 B→B:同一算法自身的 50 步复现度 ≈ 0.66,
+所以 0.675 分辨不出 pipeline 差异,只分辨得出种子(0.2)。迁移在训练层面闭环。
+
+**@1500(终点):** 5s SGF 7.56 / PKV 11.93;60s SGF 7.00 / PKV 10.38。两者都低于起点(8.72 / 10.50),PKV 约为 SGF 的 1.5×。
+5s 全程:SGF 10.2 → 7.0 → 19.3 → 18.8 → 11.2 → 7.6;PKV 25.2 → 13.1 → 20.4 → 15.5 → 12.3 → 11.9(@50/200/750/1000/1300/1500)。
+两条曲线都大幅起伏、在 750–1000 交叉;终点差 1.5× 与 SGF 自身换种子在 50 步就出现的 1.3× 同量级,单次 run 分不出是 pipeline 还是种子。
+要在 1500 步上下结论需要同种子的两条 1500 步 run(各 8 卡 × ~8 h),由用户决定。
+
+**240s 官方 VBench 补齐(imaging_quality 单独重跑后 7/7):** quality_score SGF 0.8158 vs MemLoRA 0.8186(+0.0028);
+60s 为 0.8221 vs 0.8257(+0.0036)。两个时长上 MemLoRA 在 6 个一致性/质量维度略高、dynamic_degree 明显更低(0.41 → 0.30),
+官方加权(dynamic_degree 权重 0.5)后仍是 +0.003 左右的小幅领先。
+
+## KVForcing + Memory-LoRA(用户要求:加法与 mem_lora 完全一致,并验证行为完全一致)
+
+实现(全部带 `ours` 标记,默认关闭):`MemoryLoRA`(rank 64、down ~N(0,1/rank)、up 零、scale 1)挂在 `CausalWanSelfAttention` 上(`memory_lora=True` 才构造);
+路由与 mem_lora 逐条相同 —— cache 路径 `memory_write=True` 的前向、TF 路径的 clean 半边、persistent 路径的 page 写入(`write_page`)用 (W+dW)h,
+dW 加在 norm_k 之前;`init_weights` 末尾重置 dW=0;`_forward_inference` 透传 `memory_write`;wrapper `memory_lora` 构造开关 +
+`memory_lora_write` 前向标记(kv_cache 分支传给模型);`CausalInferencePipeline` 的 cache 刷新标记 `memory_lora_write=True`;
+SF 基线的 context 写入同样标记;trainer 为 `memory_lora` 参数单独 lr(`lr_memory_lora`);`scripts/make_lora_init.py` 生成带零 adapter 的 init ckpt;
+配置 `configs/kv_forcing_lora_framewise.yaml`。
+验证(进行中,630756 / 630758–630760):tiny 同 adapter 权重且 up≠0 下 新 kv_forcing+LoRA vs 旧两趟 mem_lora / 旧一趟 PKV+LoRA;
+真实配置单步(共用旧 lora-init,up 扰动 1e-3)含 LoRA-only 与 backbone-only 的梯度 cos;推理 latents 对比(旧 MemoryLoRAInferencePipeline vs 新 CausalInferencePipeline,A-vs-A 作地板);
+50 步 1×8 seed 1:新 kv_forcing+LoRA vs 旧 memory_lora_forcing,比 adapter `up`(即位移)与 backbone 位移的 cos。
+
+**KVForcing + Memory-LoRA 验证结果(第一轮):**
+- tiny(同 adapter 权重、up≠0):新 kv_forcing+LoRA vs 旧两趟 mem_lora grad cos 0.9999999739、rel 2.3e-04、loss rel 1.8e-07、rollout 2.9e-05;
+  vs 旧一趟 PKV+LoRA cos 1.0000000000、rollout 0.000e+00;有/无 LoRA 的 loss 0.32816 vs 0.32756(adapter 确实在起作用)。
+- 推理:同 lora ckpt(up 扰动 1e-2)、同噪声同 prompt,旧 MemoryLoRAInferencePipeline 与新 CausalInferencePipeline 的 latents **逐位相同**(0.000e+00);
+  A-vs-A 也逐位相同;adapter 扰动 vs 置零差 67%(路由确实生效)。
+- 真实配置:新臂正常(峰值 48.12 GiB);旧两趟 mem_lora 臂在 backward 报 cuDNN INTERNAL_ERROR(疑似显存边缘,无 LoRA 时两趟就已 69.6 GiB),
+  正用 expandable_segments 重试,失败则两臂都降到 13 帧比较。
+- KV Forcing(无 LoRA)的 1500 步完整训练已启动(kvruns/logs_kv_forcing,seed 1,1×8);LoRA 版等真实配置对照通过后启动。
+
+**LoRA 逐张量诊断:** tiny(fp32)两趟 mem_lora vs 新一趟 kv_forcing+LoRA:24 个 adapter 张量全部 cos 0.999999(up、down 均然)—— 结构等价。
+真实配置(bf16):`down` 梯度 cos 0.99998,`up` 梯度逐层 cos≈0(范数一致)。`up` 的梯度纯来自记忆路径(约 backbone 的 1%),
+而两臂 rollout 在 bf16 下差 1.5%,疑为小信号被 bf16 噪声淹没;A-vs-A 重跑与 fp32 少帧对比正在跑以判别。
+**50 步 seed 1 训练(同 lora-init):** kv_forcing+LoRA vs 两趟 mem_lora,adapter `up` 位移 cos **0.599**(|v| 0.727 vs 0.755),backbone 位移 cos 0.649 ——
+与无 LoRA 时一趟 vs 两趟(0.675)、同算法重实现(0.658)同一水平;前 6 步 loss 逐位一致。
+
+**LoRA 判别结果(A-vs-A):** 同一臂用同一种子重跑,adapter `up` 梯度自身就不复现 —— 一趟 k/up cos -0.057、v/up -0.005;两趟 mem_lora k/up -0.017、v/up -0.047;
+而 `down`(0.9999)与 backbone(0.9999)都复现。所以真实配置 bf16 下"两实现 `up` 梯度 cos≈0"就是各自的自复现地板:`up` 的单步梯度(up≈0 时纯记忆路径、约 backbone 的 1%)
+被 flash-attn 反向的非确定性与 bf16 噪声淹没,这是方法本身在该精度下的性质,不是实现差异。结合 tiny fp32 结构等价(24 张量 0.999999)、
+推理 latents 逐位相同、50 步 adapter 位移 cos 0.60(与 backbone 地板同级),判定 KVForcing+LoRA 与 mem_lora 行为一致。
+**KV Forcing + LoRA 的 1500 步完整训练已启动**(kvruns/logs_kv_forcing_lora,seed 1,1×8,新生成的 causal_cd_lora_init.pt)。
+fp32 补充对照:base.py 把最少生成帧数硬编码为 21,少帧无法跑;两趟臂 21 帧 fp32 三模型同卡超 80 GB。A-vs-A 已足以定性,此项不再补。
+
+**KVForcing 两条完整训练完成(09-07):** `kvruns/logs_kv_forcing` 与 `kvruns/logs_kv_forcing_lora`,各 1500 步、1×8、seed 1,无报错,
+checkpoint_model_001500 均已落地(>200 步为 EMA 权重)。19 vs 21 s/step 的差主要是节点功耗限频差异,LoRA 固有开销约几个百分点。
+
+**KVForcing 两条 1500 步 run 的 @1500 评测(5s / 60s 相邻帧差):** sgf 7.56 / 7.00,pkv 11.93 / 10.38,mem_lora 6.60 / 5.67,**kvf 6.74 / 6.61**,**kvf_lora 20.91 / 20.46**。
+kvf 与 sgf、mem_lora 同级;kvf_lora 在两个时长上都是其他方法的 3 倍且 8 条 prompt 一致。
+**归因交叉检查:** 旧 mem_lora@1500 走新推理 6.601(=旧 6.602);kvf_lora@1500 走旧推理 20.904(=新 20.906)→ 推理无关。
+kvf_lora@1500 把 adapter `up` 置零再采样仍 19.75 → 闪烁在 **backbone 权重**里,不在 adapter 里:带 adapter 训练把 backbone 推到了闪烁区,
+而同种子、无 adapter 的 kvf 没有。训练日志(loss / grad norm 逐 250 步窗口)三条 run 无异常。
+进行中:adapter 幅度增长曲线(kvf_lora vs 旧 mem_lora)、kvf_lora 5s@250..1250 与 60s@500/1000 轨迹、mem_lora 全程 5s/60s 运动量表(用户记得"短变快、长变慢")。
+
+**adapter 增长曲线(|up| / |dW|_k / |dW|_v,逐 250 步):** kvf_lora 与旧 mem_lora 几乎重合 —— @1500 |up| 3.65 vs 3.34、|dW|_k 2.20 vs 1.91、|dW|_v 1.60 vs 1.48
+(|W_k| 291,dW 约 0.7%);@50 两条 seed-1 短 run 0.727 vs 0.755。**adapter 动力学在两种实现下相同**,排除"一趟下 up 梯度噪声被 Adam 放大"。
+**kvf_lora 5s 轨迹:** 250 → 10.1,500 → 8.8,750 → 13.5,1000 → 18.8,1250 → 18.8,1500 → 20.9;同种子无 LoRA 的 kvf:500 → 7.8,1000 → 9.3,1500 → 6.7。
+从 750 起持续偏高而非终点偶然。对照历史:一趟无 LoRA 的 pkv(随机种子)曾 50 → 25、750 → 20、1500 → 11.9,两趟 sgf 750 → 19.3。
+n=1/格,kvf_lora=20.9 vs mem_lora=6.6 目前分不出"一趟+LoRA 系统性偏闪"还是种子方差;需补种子(kvf_lora seed 2、kvf seed 2、mem_lora seed 1)才能定。
+
+**一趟是否引入比两趟更多的数值误差(用户提问):** tiny 同权重同输入,各 pipeline 的 bf16 梯度对自身 fp32 梯度 —— 两趟 rel 4.4e-03(cos 0.9999902),
+一趟 rel 6.3e-03(cos 0.9999801),一趟 bf16 vs 两趟 bf16 rel 5.3e-03。一趟多约 40%,来源是 42 次 backward 贡献在 bf16 `.grad` 中累加(两趟 1 次)+ page 拼接;
+真实规模下一趟 vs 两趟 6.9e-03 与各自 A-vs-A(~1e-02)同级,测不出额外误差;fp32 下 2.4e-04 为纯内核差,无偏差。可用 fp32 梯度累加抹掉,代价是显存。
+
+**误差来源定位(用户:"我们是重放,为什么会多误差"):** 重放本身零误差(checkpoint 开关梯度逐位一致)。多出的部分全部来自 **bf16 梯度累加**:
+tiny 同权重同输入,各 pipeline 的 bf16 梯度对自身 fp32 —— 两趟 bf16 累加 4.447e-03、fp32 累加 4.434e-03(不变,每参数只有 1 次贡献);
+一趟 bf16 累加 6.342e-03、**fp32 累加 4.125e-03**(降到两趟以下)。一趟 vs 两趟在 fp32 累加下 2.1e-03(bf16 累加下 5.3e-03)。
+机制:一趟每个参数在带梯度前向中被用 42 次(21 帧 × noisy + writer),42 个 bf16 贡献在 bf16 `.grad` 中逐次相加;两趟只有 1 次。
+FSDP MixedPrecision(param bf16)下训练同样如此。修法:fp32 master 参数 + bf16 autocast 计算(每次使用时 cast,累加在 fp32),
+显存代价约 +2.8 GB 未分片参数副本;是否改训练精度策略由用户定(会影响与两趟基线的可比性,需同策略重训对照)。
+
+**mem_lora(两趟+LoRA,随机种子)全程运动量:** 5s 50 → 11.4,100 → 10.6,**200 → 36.1,250 → 32.3,450 → 24.6**,1500 → 6.6;
+60s 50 → 13.5,100 → 9.2,**200 → 33.5,250 → 31.2,450 → 21.3**,1500 → 5.7。
+**kvf_lora 60s:** 500 → 7.5,**1000 → 21.8**,1500 → 20.5(5s:750 → 13.5,1000 → 18.8,1500 → 20.9)。
+→ 两趟+LoRA 自己在 200–450 步经历过一次更大的闪烁漂移(短、长视频同时到 31–36),到 1500 回落;kvf_lora 的漂移从 750 起、1500 时仍在 ~20。
+同一现象、不同时机,与"一趟特有的 bug"不符,与 LoRA 训练存在闪烁漂移阶段 + 混沌时机一致。kvf_lora 若继续训练是否回落,未知。
+用户记的"mem_lora 短快长慢":1500 步时短、长都比起点慢;200–450 时短、长都快;长视频 VBench dynamic_degree 低(0.30 vs 0.41)是"长慢"的来源。
+
+**mem_lora 5s 全程(补齐):** 50 → 11.4,100 → 10.6,**200 → 36.1**,250 → 32.3,450 → 24.6,500 → 22.2,750 → 18.1,1000 → 13.7,1300 → 8.0,1500 → 6.6 ——
+一次大漂移后单调回落。kvf_lora:250 → 10.1,500 → 8.8,750 → 13.5,1000 → 18.8,1250 → 18.8,1500 → 20.9 —— 同类漂移、更晚发生、1500 时未回落。
+
+**显存重测(块级 checkpoint、T=21、单卡 bf16、仅 generator):** 一趟峰值 20.68 GiB(TF 首步 40.01)。峰值存活:page 5.63、page 梯度 5.35(旧分解里的"concat 40%"
+其实是 cat 反向切成 view 的 page 梯度,把 60 个 21-page 大缓冲钉住;改成 `_PageCat` clone 切片后大缓冲消失、总量不变 —— **不可消**)、
+块间隐状态 5.39(块级 checkpoint 边界输出,21×30×2)、反向临时 2.84。可动项只有块间隐状态 → 新增 `kv_forcing_checkpoint_group`(每 G 块一组 checkpoint,数值逐位不变,
+G=5 下 page==cache 0 / ckpt 精确 / 梯度一致),G 扫描进行中。
+
+**checkpoint 分组扫描(T=21、单卡 bf16、仅 generator,峰值激活 / fwd+bwd 时间):** G=1 20.46 GiB / 25.3 s;G=2 18.00 / 19.7;G=3 17.41 / 17.3;
+**G=5 17.34 / 15.9**;G=6 17.52 / 15.3;G=10 18.58 / 14.4;G=15 20.17 / 14.2;G=30 25.29 / 13.7。G=5 比逐块省 3.1 GiB 且快 37%,数值逐位不变;
+默认改为 5。此时一趟峰值 17.3 GiB < 两趟稳态 21.8(两趟首步 40–48)。
+**240s @1500:** sgf 6.51 / pkv 11.43 / mem_lora 5.07 / kvf 6.92 / kvf_lora 19.70 —— 与 5s、60s 同一格局。
+**用户决定:所有训练改 fp32**(不做 autocast 修法)。注意 flash-attn 只接受半精度,`attention()` 会把 fp32 q/k/v cast 成 bf16 再 cast 回来,
+所以"fp32 训练"= 权重/激活/梯度累加 fp32、注意力核心 bf16。fp32 显存与速度、1×8 冒烟进行中。
+
+**fp32 显存/速度(T=21、单卡、仅 generator,峰值激活 / fwd+bwd):** 一趟 fp32 G=1 40.20 GiB / 30.8 s,**G=5 33.38 / 26.0 s**,G=10 34.74 / 25.7 s(权重 5.30);
+两趟 TF fp32 40.02 GiB / **211 s**(flex_attention 在 fp32 下极慢;一趟走 flash 内部 cast bf16 不受影响)。
+对比 bf16 一趟 G=5(17.34 / 15.9 s):fp32 +93% 显存、+64% 时间。1×8 fp32 冒烟(20 步)进行中。
+
+**fp32 冒烟(1×8、20 步):** 全 fp32:~32 s/step,nvidia-smi 峰值 80.9 GB(顶到天花板);加 `real_score_bf16`(冻结 teacher bf16、输入进门时 cast):
+~21 s/step,nvidia-smi 79.9 GB(reserved,不反映 allocated;trainer 已加 `[mem]` 行打印 allocated/reserved)。无 OOM,loss 正常。
+**已启动 fp32 完整训练(用户批准):** kvruns/logs_kv_forcing_fp32 与 logs_kv_forcing_lora_fp32,1×8、seed 1、G=5、teacher bf16。
+
+**两趟 SGF 全 fp32 训练冒烟(旧仓库、1×8、10 步,无 teacher-bf16 选项):** 未 OOM;nvidia-smi 峰值 79.5 GB;`[timing]` 步 1–5(纯 critic 步,含首步 mask 尖峰)23.4 s/step,
+步 6–10(含 1 个 generator 步)35.5 s/step → generator 步约 84 s、5 步周期均值约 35 s/step。一趟全 fp32 冒烟约 32 s/step;一趟 fp32 + teacher bf16 约 21 s/step。
+注:单卡 TF fp32 的 211 s 含 flex_attention 首次编译,不代表稳态。

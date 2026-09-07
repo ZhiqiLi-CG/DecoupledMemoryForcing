@@ -1,4 +1,123 @@
-# Persistent Differentiable KV Write
+# Persistent Differentiable KV Write —— 一趟 KV Forcing 的算法与实现(当前版)
+
+> 本文第一部分是**当前实现**(仓库 `causal/KVForcing`,commit `0e730f4`,2026-09-07)的权威描述;
+> 第二部分(附录)保留了在 `SelfGradientForcing` 内做原型时的全部记录与验证数字,供追溯。
+
+## 0. 一句话
+
+自回归视频扩散模型逐帧生成,把已生成帧存进 KV cache。Self Forcing 在自身 rollout 上训练时,后面帧的 loss
+到不了前面帧写进 memory 的那条路(cache 原地覆盖、写入 stop-gradient);两趟 SGF 靠第二遍 teacher-forcing 并行前向补回这条路。
+**KV Forcing 只用一趟**:每帧的 memory 写成**不可变的 page** 而不是写进 cache buffer,page 带图,后帧 loss 沿 page 链回传到每一前帧;
+因为 page 不变,每帧前向都能 activation-checkpoint 并在反向时对着完全相同的历史重算,显存只有"一组 block 的激活 + 所有 page"。
+rollout 本身(退出步抽样、去噪时间表、context 加噪、写什么进 memory)与 Self Forcing 完全一致;推理不变,仍用普通 KV cache。
+
+## 1. 算法(一步训练里 generator 做了什么)
+
+记 T=21 帧、S=4 个去噪步 `[1000, 750, 500, 250]`(warp 后 `[1000, 937.5, 833.3, 625]`)。
+
+1. **抽退出步** `idx ∈ {0..S-1}`(默认 `per_rank_exit_step: true`:每个 rank 自己抽;否则 rank 0 抽后广播),训练时间步 `train_t = steps[idx]`。
+2. 对每帧 i = 0..T-1,取历史 page 快照 `hist = store.snapshot_all_layers()`(30 层 × (K pages, V pages) 的引用元组;之后 append 不会改变这份快照)。
+3. **rollout(无梯度,和推理一模一样)**:从噪声出发,依次在每个去噪步上跑 `noisy` 前向(读 hist 的 page + 自己的 K/V),
+   记下 `noisy_at_t`(退出步的输入)与 `x0_exit`(退出步的预测);步间用 `scheduler.add_noise` 重加噪。
+   `x0_cache = x0_exit`(`cache_mode: exit`;`final_clean` 用最后一步的 x0),`x_ctx = add_noise(x0_cache, context_timestep)`。
+4. **两个带梯度的前向**:
+   - `noisy`:在 `train_t` 上重算 `noisy_at_t` 的预测 → 这一帧的输出(loss 看的就是它);
+   - `write`:对 `x_ctx`(`match_context: true`;否则用干净 x0 与 t=0)跑 writer,**返回这一帧 30 层的 (K, V) page**,`store.append_all_layers(pages)`。
+5. 21 帧输出拼起来交给 DMD loss;顺带返回 `denoised_timestep_from/to`(与 SF 同一算式;`ts_schedule: false` 时不被使用)。
+
+**梯度路径**:`L_i → x0_i(noisy 前向) → 它读到的 pages_{<i} → 写这些 page 的 writer 前向 → 它们读到的 pages_{<j} → … → 参数`。
+没有任何 detach/no_grad 落在 page 上;末帧自己的 page 没有读者,梯度恒为 0(这是链方向正确的标志,测试里显式检查)。
+
+**为什么等价于两趟 SGF 的 pass 2**:TF 前向里,clean 半边的 token 是 memory、noisy 半边是 generation,掩码让 noisy 帧 i 看 clean 帧 <i,
+clean 帧 j 看 clean 帧 ≤ j。这里 writer(page 写入)对应 clean 半边,noisy 前向对应 noisy 半边,page 拼接顺序对应因果掩码。
+在 21 帧、`local_attn_size 18 + sink_size 3` 下三套可见规则(TF 掩码 / cache 读取 / page 拼接)逐帧同集,pipeline 拒绝更长的 clip。
+
+## 2. 代码在哪(全部带 `# ======== ours ========` / `# ==== ours end ====` 标记)
+
+| 层 | 位置 | 内容 |
+|---|---|---|
+| 模型·工具 | `wan/modules/causal_model.py` `PersistentKVStore`(:131) | 每层的 K/V page 列表;`append_all_layers`、`snapshot_all_layers`(返回引用元组) |
+| 模型·工具 | 同文件 `_PageCat`(:160) | 历史 page 的 `torch.cat`,反向把每页梯度 **clone 成连续张量**(否则 cat 的反向返回大缓冲的 view,被 `.grad` 钉住;数值不变) |
+| 模型·attention | `CausalWanSelfAttention.forward(..., persistent=None, memory_write=False)` → `forward_persistent`(:532) | q/k/v 投影 → RoPE(绝对帧位置 `current_start_frame`)→ `_PageCat(history_k, k_rope)` → flash-attn → `o`;`write_page=True` 时额外返回 `(k_rope, v)` 作为 page |
+| 模型·block | `CausalWanAttentionBlock.forward(..., persistent=None, memory_write=False)` → `forward_persistent`(:679) | 与 `forward()` 完全同构,只是 K/V 的来源/去向不同;cross-attention 不用 cache(保持区域无可变状态,重算才可复现) |
+| 模型·顶层 | `CausalWanModel.forward` 分派(:1440):`persistent_mode="noisy"/"write"` → `forward_noisy_frame`(:1501)/`forward_clean_writer`(:1508) | 经 `__call__` 分派而不是裸方法,保证 FSDP 的前向 hook(all-gather、cast)生效 |
+| 模型·checkpoint | `_persistent_blocks`(:1484)/`_run_blocks`(:1467) | 每 `persistent_checkpoint_group`(默认 5)个 block 一个 `torch.utils.checkpoint` 区域,在 FSDP 单元**内部**;区域边界(块输出与 page)保留,其余重算 |
+| wrapper | `utils/wan_wrapper.py` `WanDiffusionWrapper.forward(..., persistent_mode, persistent_history, persistent_start, memory_lora_write)`(:251-:286) | `noisy` 走 flow→x0 转换与 kv_cache 分支同一段代码;`write` 直接返回 page 元组 |
+| pipeline | `pipeline/kv_forcing_training.py` `KVForcingTrainingPipeline` | 第 1 节的全部流程;`checkpoint_group`、`match_context`、`cache_mode`、`per_rank_exit_step`、`last_step_only`;拒绝 `num_frame_per_block != 1` 与超出 `local + sink` 的帧数 |
+| 分派 | `model/base.py` `_initialize_inference_pipeline`(:239) | `grad_mode: kv_forcing` → 上述 pipeline;`self_forcing` / `self_forcing_no_sg` → `pipeline/self_forcing_training.py`(同一 rollout,只差 stop-gradient) |
+| 配置 | `configs/kv_forcing_framewise.yaml`、`configs/default_config.yaml` | `grad_mode`、`kv_forcing_checkpoint_group`、`match_context`、`cache_mode`、`per_rank_exit_step`、`mixed_precision`、`real_score_bf16` |
+
+同一个 `CausalWanModel` 既训练又推理;推理不走 persistent 路径,`CausalInferencePipeline` 的 cache 刷新只多了 `memory_lora_write=True` 标记(见第 3 节)。
+
+## 3. Memory-LoRA(`model_kwargs.memory_lora: true`,与两趟 mem_lora 的加法完全一致)
+
+- `MemoryLoRA`(:105):`dW h = up(down(h))`,rank 64,`down ~ N(0, 1/rank)`,`up = 0`,scale 1;`init_weights` 末尾重置,保证 dW 从 0 起步。
+- **只有"记忆写入"用 (W + dW)**,加在 K/V 投影之后、**`norm_k` 之前**:
+  cache 路径 = `memory_write=True` 的前向(训练里 SF 基线的 context 写入、推理里的 cache 刷新);TF 路径 = clean 半边;persistent 路径 = `write_page=True` 的 writer。
+  generation(noisy 前向、去噪步)一律用 W。
+- 训练:`lr_memory_lora`(1e-4)单独参数组;init ckpt 由 `scripts/make_lora_init.py` 写入零 adapter(trainer 严格加载)。
+- 与旧 mem_lora 的一致性:tiny fp32 下 24 个 adapter 张量梯度 cos 0.999999;推理 latents 逐位相同;adapter 幅度增长曲线 1500 步内重合(|up| 3.65 vs 3.34)。
+  真实规模 bf16 下 `up` 的单步梯度两实现 cos≈0 —— 但同一实现自己重跑也≈0(`down` 与 backbone 0.9999),是该小信号在 bf16 下的自复现地板,不是差异。
+
+## 4. 显存与速度(T=21、单卡 H100、仅 generator 的 fwd+bwd,权重不计)
+
+| 配置 | 峰值激活 | fwd+bwd |
+|---|---|---|
+| 一趟 bf16,G=1(逐块 checkpoint) | 20.46 GiB | 25.3 s |
+| **一趟 bf16,G=5(默认)** | **17.34 GiB** | **15.9 s** |
+| 一趟 bf16,G=30(整帧一个区域) | 25.29 | 13.7 s |
+| 两趟 TF bf16,pass 2 | 首步 40.0(`create_block_mask` 的 int64 尖峰);稳态约 21.8 | 11.5 s(不含 pass 1) |
+| 一趟 fp32,G=5 | 33.38 | 26.0 s |
+| 两趟 TF fp32 | 40.0 | 稳态未单测(训练冒烟见下) |
+
+峰值构成(bf16、G=1):page 5.6 + page 梯度 5.3(不可消:方法本体;旧记录里的"concat 40%"就是它的 view 形态)+ 块边界隐状态 5.4(**可消**:分组 checkpoint)+ 反向临时 2.8。
+G 是 U 形:边界少 vs 重算临时多,G=3–6 最低;G 越大越快(checkpoint 区域越少)。
+
+真实 1×8 训练(8 卡、batch 1×8、含 14B teacher 与 1.3B critic):
+
+| | 每步 | 每卡 allocated 峰值 |
+|---|---|---|
+| 一趟 bf16 | 19 s | ~48 GB(nvidia-smi) |
+| 一趟 fp32 + teacher bf16(当前配置) | 30 s | **55.9 GiB**(reserved 74.7) |
+| 一趟 全 fp32 | ~32 s | 顶到 80 GB(reserved) |
+| 两趟 全 fp32 | ~35 s(generator 步约 84 s) | 顶到 80 GB(reserved) |
+
+## 5. 精度策略(用户决定:训练全 fp32)
+
+- `mixed_precision: false`:权重、激活、**梯度累加**全 fp32。原因:一趟里每个参数在带梯度前向中被用 42 次(21 帧 × noisy + writer),
+  bf16 `.grad` 累加会比两趟(每参数 1 次)多引入约 40% 舍入(tiny 实测:两趟 4.4e-3、一趟 6.3e-3、一趟 fp32 累加 4.1e-3);checkpoint 重算本身零误差。
+- `real_score_bf16: true`:冻结的 14B teacher 以 bf16 前向(FSDP MixedPrecision + 输入进门 cast),它没有梯度,不影响任何累加精度;每步从 ~32 s 降到 30 s,腾出显存。
+- flash-attn 只接受半精度:`attention()` 把 fp32 q/k/v cast 成 bf16 计算再 cast 回 —— 注意力核心永远是 bf16,两趟也一样。
+- page 不能存 bf16:page 的梯度按 page 的 dtype 累加(每页收后面所有帧的 2×(T−j) 次贡献),存 bf16 就把累加又变回 bf16。
+
+## 6. 验证了什么(测试在仓库外 `/mnt/data/zhaofeng/runs/sgf/kvtests/`,不入库)
+
+| 层级 | 检查 | 结果 |
+|---|---|---|
+| 模型 | noisy 前向 vs cache 路径;page vs cache slot;checkpoint 开关;末帧 loss 到达首帧 page | 0.000e+00 / 0.000e+00 / 0.000e+00 / 到达且末帧 page 梯度为 0(G=1 与 G=5 均通过) |
+| tiny(fp32、6 层、21 帧) | 新 sf / no_sg / kv_forcing vs 旧仓库同名分支 | sf 逐位、no_sg 1.2e-05、kv_forcing vs 旧一趟 2e-06;vs 旧两趟 SGF 2.4e-04(flash vs flex 内核) |
+| 真实配置(1.3B、21 帧、bf16 FSDP、同随机流) | kv_forcing vs 两趟 SGF | loss rel 1.18e-04、grad cos 0.9999761、Δθ cos 0.9996489;vs 旧一趟 rollout 逐位相同 |
+| 8 卡逐 rank(hybrid_full / full) | 一趟 vs TF 并行梯度,reduce 之前 | 最差 cos 0.9999950 |
+| 训练 50 步 seed 1 | 位移 cos:新一趟 vs 旧一趟 0.658、vs 两趟 0.633、换种子 0.2 | 同算法自身的 50 步复现度就是 ≈0.66(flash 反向非确定性),cos 只能分辨种子 |
+| 推理 | 同权重同噪声,新 `CausalInferencePipeline` vs 旧 | latents 逐位相同(含 LoRA ckpt) |
+
+**结论**:一趟与两趟在能测的每一层上等价(fp32 下差异 = 两个注意力内核的差;bf16 下差异 = 各自的自复现地板);
+长训练轨迹的差异(如 kvf_lora@1500 的闪烁 20.9 vs mem_lora 6.6)在 n=1 下分不出算法与种子,mem_lora 自己也在 200–450 步经历过 31–36 的漂移后回落。
+
+## 7. 已知边界
+
+- 只实现并验证了 `num_frame_per_block = 1`(chunkwise 被拒绝)。
+- persistent 路径读**全部**历史 page,等价于 sink+window 仅当 `local_attn_size + sink_size ≥ 帧数`(默认 18 + 3 = 21);超出即拒绝。
+- 21 帧、local 18 + sink 3 在训练里退化为全因果注意力(TF / cache / page 三套规则都如此),推理 cache 只有 18 帧 —— 这是参考实现原有的训练/推理错位,原样继承。
+- paged attention kernel(消 page 拼接)未实现:块级/分组 checkpoint 后拼接每次只活 G 个 block(G=5 约 1 GiB),已不值得。
+
+---
+
+# 附录:原型阶段记录(`SelfGradientForcing` 内,2026-09-05 至 09-06)
+
+> 以下为在旧仓库内以 `PersistentKVWanModel` 副本实现时的原始文档与验证数字,已被上文取代,仅供追溯。
+> 其中"concat 40%"的分解是帧级 checkpoint 时的测量,且把 page 梯度的 view 误记为拼接,见上文第 4 节。
+
 
 一趟的自回归训练算法。目标:得到与 SGF 两趟**等价的梯度**,但只做一趟前向。
 
@@ -11,7 +130,7 @@
 
 ---
 
-## 1. 要解决的问题
+### 1. 要解决的问题
 
 SGF 的两趟结构:
 
@@ -24,7 +143,7 @@ SGF 的两趟结构:
 被反复覆写的 buffer,写进去的东西必须 `detach()`,否则 autograd 图会引用被后续帧
 改写过的内存。所以第 i 帧的 loss 到不了第 j<i 帧。
 
-## 2. 核心想法:不可变的 page
+### 2. 核心想法:不可变的 page
 
 不覆写 buffer,而是让每一帧**返回**它写的 K/V,由一个只追加的容器持有:
 
@@ -46,7 +165,7 @@ class PersistentKVStore:
   被覆写的 buffer 做不到这一点(重算时读到的是后续帧写进去的值),不可变的 page
   可以。没有不可变性就没有 checkpoint,没有 checkpoint 一趟法在 T=8 就 OOM。
 
-## 3. 每帧两个前向
+### 3. 每帧两个前向
 
 ```python
 for i in range(T):
@@ -73,7 +192,7 @@ y = attention(q_rope, k_attn, v_attn)
 
 这也是它不需要 `create_block_mask` 的原因 —— 见第 5 节的显存后果。
 
-## 4. 验证
+### 4. 验证
 
 | 验证项 | 结果 | 脚本 |
 |---|---|---|
@@ -89,7 +208,7 @@ y = attention(q_rope, k_attn, v_attn)
 `test_persistent_grad.py` 里 frame T-1 的 page 梯度为 0 是**正确行为**(它写在 loss
 之后,没有后续帧读它),不是失败。探针有效的证据是 frame 0/1 非零。
 
-### 等价性怎么判的
+#### 等价性怎么判的
 
 两条路径用**不同的 attention kernel**(SGF 走 flex_attention + block mask,一趟法走
 flash + 拼接过去的 page),不可能逐位相等,所以任何固定阈值都是拍脑袋。改为先量出
@@ -115,7 +234,7 @@ flash + 拼接过去的 page),不可能逐位相等,所以任何固定阈值都�
 随机初始化的模型几乎不读位置,该对照只有 1.157e-04,和被检验的量同级,证明不了任何
 事。rope 最终由 `test_rope_alignment.py` 直接单测解决(无模型、无阈值)。
 
-### 4.1 pipeline 级等价 —— 已证明与未证明的边界
+#### 4.1 pipeline 级等价 —— 已证明与未证明的边界
 
 **已证明:** persistent differentiable path 与 SGF 的 differentiable Pass-2
 computation 在数值上等价。
@@ -125,7 +244,7 @@ validation:同 batch 同 RNG 的完整 training step 的 loss、optimizer 之前
 梯度、以及 AdamW step 之后的参数 delta 方向。在这三项通过之前,不能说
 "the overall training update is equivalent to SGF"。
 
-### 4.1.1 pipeline 级数值等价
+#### 4.1.1 pipeline 级数值等价
 
 `pipeline/persistent_kv_training.py` 结构严格对齐 `_self_gradient_forcing_inference`:
 同样的 exit step 采样、同样的 context 加噪、同样的 x0 缓存模式。唯一变化是第二趟没了,
@@ -141,7 +260,7 @@ context 加噪、决定写什么。所以单独测:运行时**记录一趟 pipel
 | output(DMD loss 消费的 x0) | **3.124e-05**(比前向 kernel 地板低 114 倍) |
 | 全局参数梯度 | **2.193e-04**,余弦 **0.9999998808**(比反传地板低 24 倍) |
 
-### 4.2 Memory-LoRA(`memory_lora=True`,默认关闭)
+#### 4.2 Memory-LoRA(`memory_lora=True`,默认关闭)
 
 记忆写入器用 `(W + ΔW)`,生成路径用 `W`,无 stop-gradient:
 
@@ -176,7 +295,7 @@ mask 掉 noisy 那一半、并往 cache 路径透传 `memory_write` 标志 —�
 1.388e+00 的假失败。正确做法是让 LoRA 模型 `load_state_dict(plain.state_dict(),
 strict=False)`。
 
-## 5. 显存与速度
+### 5. 显存与速度
 
 **测量条件:** Wan 1.3B(dim 1536 / 30 层 / 12 头),60×104 latent → 1560 token/帧,
 batch 1,4 步去噪,**FSDP + MixedPrecision(与训练一致)**,单张 H100-80GB,
@@ -211,13 +330,13 @@ token 的并行前向,一趟法是 42 次 1560 token 的串行前向。
 粒度已改为块级,需重测**):concat 40.2% / page 18.5% / 单帧重算激活 41.2% /
 page 梯度 ≤2.3%。
 
-## 6. 已知未决 / 下一步
+### 6. 已知未决 / 下一步
 
 - paged attention kernel(消 concat,估算 24.16 → 约 12 GiB,**未实现**)
 - sink / FIFO / top-aligned RoPE
 - 接入训练(Memory-LoRA 分支已实现并验证,见 4.2)
 
-## 7. 相关脚本
+### 7. 相关脚本
 
 全部在 `/mnt/data/zhaofeng/runs/sgf/tests/`:
 `test_persistent_equiv.py` `test_persistent_grad.py` `test_persistent_memory.py`
@@ -226,7 +345,7 @@ page 梯度 ≤2.3%。
 `memory_report.py`(汇总所有显存数据,从日志读取,不手填)
 
 
-## 8. window / sink 的适用范围(不要误读)
+### 8. window / sink 的适用范围(不要误读)
 
 persistent 路径 **没有实现** window 和 sink:`forward_persistent` 读取全部 page。
 
@@ -240,7 +359,7 @@ mask 相同意味着**没有任何 key 被丢弃 —— 窗口在这个长度上
 真正发生,届时必须先实现 window/sink 再单独验证。pipeline 里已有硬断言,
 越界时直接抛错而不是静默降级。
 
-## 9. 每个验证覆盖了什么(S9:绿灯不会自己外推)
+### 9. 每个验证覆盖了什么(S9:绿灯不会自己外推)
 
 一个通过的测试只对它实际跑过的 (设备数, 抽象层, 配置) 有效。这份表把覆盖范围写出来,
 免得下次再出现「pipeline 级单卡全绿、4 卡 DMD 级崩掉」时找不到缺口在哪。
