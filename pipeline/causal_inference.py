@@ -410,8 +410,14 @@ class CausalInferencePipeline(torch.nn.Module):
             # Streaming long-video mode: cache exactly the rolling window.
             kv_cache_size = self._stream_cache_frames * self.frame_seq_length
         elif self.local_attn_size != -1:
-            # Use the local attention size to compute the KV cache size
-            kv_cache_size = self.local_attn_size * self.frame_seq_length
+            # The cache has to hold what the attention reads: the pinned sink
+            # frames AND the local window. Sized to the window alone, it is
+            # sink_size frames too small (local_attn_size 18 + sink_size 3: frames
+            # 19-21 of a 21-frame clip attend to 18 frames where training attends
+            # to all of them; chunkwise 9 + 3: 9 where training attends to 12).
+            # Unchanged when sink_size is 0.
+            sink_size = getattr(self.generator.model, "sink_size", 0)
+            kv_cache_size = (self.local_attn_size + sink_size) * self.frame_seq_length
         else:
             # Use the default KV cache size
             kv_cache_size = 32760

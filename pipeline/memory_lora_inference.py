@@ -414,8 +414,9 @@ class MemoryLoRAInferencePipeline(torch.nn.Module):
             # Streaming long-video mode: cache exactly the rolling window.
             kv_cache_size = self._stream_cache_frames * self.frame_seq_length
         elif self.local_attn_size != -1:
-            # Use the local attention size to compute the KV cache size
-            kv_cache_size = self.local_attn_size * self.frame_seq_length
+            # sink frames + local window, see CausalInferencePipeline._initialize_kv_cache
+            sink_size = getattr(self.generator.model, "sink_size", 0)
+            kv_cache_size = (self.local_attn_size + sink_size) * self.frame_seq_length
         else:
             # Use the default KV cache size
             kv_cache_size = 32760

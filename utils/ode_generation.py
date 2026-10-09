@@ -54,7 +54,9 @@ class CausalODETrajectoryGenerator:
 
     def _make_kv_cache(self, batch_size: int, device: torch.device) -> list[dict]:
         if self.local_attn_size != -1:
-            kv_cache_size = self.local_attn_size * self.frame_seq_length
+            # sink frames + local window, see CausalInferencePipeline._initialize_kv_cache
+            sink_size = getattr(self.model.model, "sink_size", 0)
+            kv_cache_size = (self.local_attn_size + sink_size) * self.frame_seq_length
         else:
             kv_cache_size = 32760
 

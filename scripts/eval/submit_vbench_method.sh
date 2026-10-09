@@ -42,14 +42,13 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
   export PYTHONPATH=/mnt/data/zhaofeng/pylibs/diffusers031:/mnt/data/zhaofeng/venvs/streamingvideo/lib/python3.10/site-packages
   export TRITON_CACHE_DIR=/tmp/triton-cache
 
-  echo '### PASS 1: 946 prompts x 5 samples ###'
+  echo '### PASS 1: 944 VBench prompts x 5 samples ###'
   OUTPUT_FOLDER=$VID NUM_SAMPLES=5 USE_EMA=$USE_EMA CONFIG=$CFG \
     bash scripts/eval/sample_for_vbench.sh short $CKPT framewise 8
 
-  echo '### PASS 2: temporal_flickering 74 prompts x 25 ###'
-  OUTPUT_FOLDER=$VID NUM_SAMPLES=25 USE_EMA=$USE_EMA CONFIG=$CFG \
-  PROMPTS=VBench/prompts/prompts_per_dimension/temporal_flickering.txt \
-    bash scripts/eval/sample_for_vbench.sh short $CKPT framewise 8
+  echo '### PASS 2: temporal_flickering 75 prompts x 25 ###'
+  OUTPUT_FOLDER=$VID USE_EMA=$USE_EMA CONFIG=$CFG \
+    bash scripts/eval/sample_for_vbench.sh short_flicker $CKPT framewise 8
 
   echo \"### TOTAL: \$(find $VID -maxdepth 1 -name '*.mp4' | wc -l) videos ###\"
 "

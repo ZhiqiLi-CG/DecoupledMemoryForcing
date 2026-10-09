@@ -21,7 +21,7 @@ gs-srun --partition=hpc-mid --gres=gpu:1 --time=04:00:00 --job-name=vbench_smoke
   echo '### STEP 1: sample videos (SGF env) ###'
   PYTHONPATH=/mnt/data/zhaofeng/pylibs/diffusers031:/mnt/data/zhaofeng/venvs/streamingvideo/lib/python3.10/site-packages \
   TRITON_CACHE_DIR=/tmp/triton-cache \
-  PROMPTS=/mnt/data/zhaofeng/runs/sgf/smoke_prompts.txt OUTPUT_FOLDER=\$OUT/videos NUM_SAMPLES=5 \
+  PROMPTS=/mnt/data/zhaofeng/runs/sgf/smoke_prompts.txt EXTENDED_PROMPTS=none OUTPUT_FOLDER=\$OUT/videos NUM_SAMPLES=5 \
     bash scripts/eval/sample_for_vbench.sh short \
       /mnt/data/zhaofeng/runs/sgf/framewise_624369/checkpoint_model_001500/model.pt
 

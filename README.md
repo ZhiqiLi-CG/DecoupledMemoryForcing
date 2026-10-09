@@ -121,6 +121,20 @@ NUM_OUTPUT_FRAMES=963 SEED=42 OUTPUT_ROOT=outputs/demo \
 
 For trained checkpoints, pass the release setting first and the produced `logs/.../checkpoint_model_*/model.pt` path as the second argument. The script uses EMA weights by default; set `USE_EMA=0` if you explicitly want the non-EMA `generator` weights.
 
+### Evaluating the model the way it was trained
+
+Training attends to the pinned sink frames plus the local window (framewise
+`sink_size 3` + `local_attn_size 18` = the whole 21-frame clip; chunkwise
+3 + 9). `scripts/infer_self_gradient_forcing.sh` and every suite of
+`scripts/eval/sample_for_vbench.sh` pass `--long_video` with that window.
+Calling `inference.py` without `--long_video` is equivalent up to 21 frames;
+until 2026-10-09 it was not, because the plain mode sized its KV cache to
+`local_attn_size` alone (sink frames included), `sink_size` frames too small.
+The model has only seen long, LLM-extended prompts: VBench prompts are sampled
+from their extended versions (`prompts/vbench/`, `--extended_prompt_path`) and
+named after the short ones. `scripts/eval/check_train_eval_consistency.py
+--inference_only` checks that the two inference modes agree.
+
 ## 🏋️ Training
 
 ### Framewise SGF
